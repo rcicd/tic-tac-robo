@@ -1,9 +1,9 @@
 import cv2
 import numpy as np
 
-chessboard_size = (9, 7)
+chessboard_size = (7, 5)
 
-images = [f'chessboard_samples/image{i}.jpg' for i in range(0, 21)]
+images = [f'calib_imgs/calib_{str(i).zfill(2)}.jpg' for i in range(1, 25)]
 
 objpoints = []
 imgpoints = []
@@ -22,8 +22,6 @@ for fname in images:
         objpoints.append(objp)
 
         cv2.drawChessboardCorners(img, chessboard_size, corners, ret)
-        # cv2.imshow('Corners', img)
-        # cv2.waitKey(0)
     else:
         print(f'Chessboard not found in {fname}')
 

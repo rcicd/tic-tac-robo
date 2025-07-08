@@ -64,8 +64,7 @@ See `logs/README.md` for detailed information about the logging structure.
 
 Before starting, calibrate your camera for best results:
 ```bash
-python do_samples.py
-python calibrate_camera.py
+python calibrate_camera_chessboard.py
 ```
 ### 2. Start the Game
 Run the main program and follow on-screen instructions:

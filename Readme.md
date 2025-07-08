@@ -1,5 +1,7 @@
 # Tic-Tac-Robo: Robot-Controlled Tic-Tac-Toe with Computer Vision
 
+[Demo](https://youtu.be/N_QuOAMHb9M)
+
 This project combines robotics, computer vision, and game AI to let a Kinova Gen3 Lite robotic arm play Tic-Tac-Toe using AprilTag (or ArUco) markers. The system recognizes the game field, reads marker positions, calculates optimal moves, and controls the robot arm to make its own moves.
 
 ## Features

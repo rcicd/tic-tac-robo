@@ -1,0 +1,7 @@
+__pycache__/
+logs/
+calibration_images/
+src/__pycache__/
+camera_calibration.npz
+*.jpg
+*.jpeg

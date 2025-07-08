@@ -10,7 +10,22 @@ This project combines robotics, computer vision, and game AI to let a Kinova Gen
 - **Minimax algorithm** for optimal Tic-Tac-Toe AI.
 - **Robot arm control** (Kinova Gen3 Lite) for marker placement.
 - **Gripper control** for manipulating physical markers.
+- **Comprehensive logging system** with automatic session management.
+- **Image saving** for all captured and processed frames.
+- **JSON data export** for detection results and analysis.
 - Clear error handling and interactive prompts.
+
+## Session Logging
+
+The system now includes comprehensive logging capabilities:
+
+- **Automatic session directories**: Each run creates a new numbered session directory in `logs/`
+- **Multi-level logging**: DEBUG, INFO, WARNING, ERROR messages to both file and console
+- **Image capture**: All original, processed, and annotated images are saved
+- **Data export**: Detection results, poses, and calibration data saved as JSON
+- **Performance profiling**: Execution time tracking for all major functions
+
+See `logs/README.md` for detailed information about the logging structure.
 
 ## Hardware and Software Requirements
 
@@ -27,7 +42,8 @@ This project combines robotics, computer vision, and game AI to let a Kinova Gen
 - `april_tag_lib.py` — Marker detection and camera calibration routines.
 - `tic_tac_toe.py` — Game logic: minimax algorithm, win check, move selection.
 - `main.py` — Demo script: robot, camera, and game integration.
-- `calib_imgs/` — Calibration images for the camera.
+- `ui.py` — User interface for game interaction.
+- `calibration_images/` — Calibration images for the camera.
 - `README.md` — This documentation.
 
 ## How It Works

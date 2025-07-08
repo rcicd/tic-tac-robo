@@ -39,6 +39,15 @@ class DeviceConnection:
         self.transport = TCPTransport() if port == DeviceConnection.TCP_PORT else UDPTransport()
         self.router = RouterClient(self.transport, RouterClient.basicErrorCallback)
 
+    def close(self):
+        """Close the connection and clean up resources."""
+        if self.sessionManager is not None:
+            router_options = RouterClientSendOptions()
+            router_options.timeout_ms = 1000 
+            self.sessionManager.CloseSession(router_options)
+            self.sessionManager = None
+        self.transport.disconnect()
+
     # Called when entering 'with' statement
     def __enter__(self):
         

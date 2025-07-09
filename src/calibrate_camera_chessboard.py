@@ -14,7 +14,7 @@ def capture_calibration_images(num_images=25, calib_dir="calibration_images"):
         print(f"Capturing image {i+1}/{num_images}. Move the board to a new position and press Enter...")
         input()
         output_path = f"{calib_dir}/calib_{i+1:02d}.jpg"
-        subprocess.run(["rpicam-jpeg", "--output", output_path, "--timeout", "100"], check=True)
+        subprocess.run(["rpicam-jpeg", "--output", "--vflip", output_path, "--timeout", "100"], check=True)
         print(f"Saved: {output_path}")
     print(f"Capture complete! Now run the calibration.")
 

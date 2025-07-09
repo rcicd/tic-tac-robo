@@ -176,6 +176,7 @@ def capture_image(path: str = "/tmp/frame.jpg") -> np.ndarray:
                 "--nopreview",
                 "--output",
                 path,
+                "--vflip",
                 "--timeout",
                 "100",
                 "--roi",

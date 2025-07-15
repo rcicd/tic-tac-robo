@@ -1,4 +1,3 @@
-import os
 import time
 import json
 import logging
@@ -191,10 +190,8 @@ def capture_image(path: str = "/tmp/frame.jpg") -> np.ndarray:
         # Save original captured image
         logger.save_image(img, "original_capture.jpg")
         
-        processed_img = ArucoTracker._preprocess(img)
-        logger.save_image(processed_img, "preprocessed_capture.jpg")
-        
-        return processed_img
+        # Return original image without preprocessing
+        return img
         
     except (FileNotFoundError, subprocess.CalledProcessError) as e:
         logger.logger.warning(f"rpicam-jpeg failed: {e}, falling back to OpenCV VideoCapture")
@@ -363,17 +360,14 @@ class ArucoTracker:
         draw_axes: bool = False,
         axes_length: float = 0.05,
     ) -> List[Tuple[int, Dict]]:
-        # cv2.imwrite("frame.jpg", frame)  # for debugging
-        # gray = self._preprocess(frame)
-        gray = frame
-        # cv2.imwrite("frame_gray.jpg", gray)  # for debugging
-        # exit()
-        
         logger = get_session_logger()
         logger.logger.info("Starting marker detection")
         
         # Save input frame
         logger.save_image(frame, "input_frame.jpg")
+        
+        # Preprocess the frame for detection
+        gray = self._preprocess(frame)
         logger.save_image(gray, "detection_input.jpg", "debug_images")
 
         corners, ids, _ = aruco.detectMarkers(gray, self._dict, parameters=self._params)

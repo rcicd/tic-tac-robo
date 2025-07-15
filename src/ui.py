@@ -8,7 +8,7 @@ from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread
+from PySide6.QtCore import Qt, Signal, QObject, QThread
 from PySide6.QtGui import QImage, QPixmap, QPainter, QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -41,6 +41,89 @@ FIELD_SIZE = CELL * BOARD
 MARKER_SIZE = 0.04
 TILE_SIZE = 0.05
 HOME_SHIFT = 0.024
+
+# ────────────────────────────────
+# Helper function for marker annotation
+# ────────────────────────────────
+
+def annotate_markers_with_symbols(image):
+    print(f"[DEBUG] annotate_markers_with_symbols called with image shape: {image.shape}")
+    try:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        gray = cv2.equalizeHist(gray)
+        print(f"[DEBUG] Applied preprocessing: grayscale + histogram equalization")
+        
+        aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+        parameters = cv2.aruco.DetectorParameters()
+        
+        parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        parameters.cornerRefinementWinSize = 5
+        parameters.cornerRefinementMaxIterations = 50
+        parameters.cornerRefinementMinAccuracy = 0.1
+        
+        print(f"[DEBUG] Created ArUco dictionary (DICT_APRILTAG_36h11) and parameters with corner refinement")
+        
+        try:
+            detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
+            marker_corners, marker_ids, _ = detector.detectMarkers(gray)
+            print(f"[DEBUG] Used new ArUco API")
+        except AttributeError:
+            marker_corners, marker_ids, _ = cv2.aruco.detectMarkers(gray, aruco_dict, parameters=parameters)
+            print(f"[DEBUG] Used old ArUco API")
+        
+        print(f"[DEBUG] ArUco detection result: marker_ids={marker_ids}, corners_count={len(marker_corners) if marker_corners else 0}")
+        
+        if marker_ids is not None and len(marker_ids) > 0:
+            print(f"Found {len(marker_ids)} markers: {marker_ids.flatten()}")
+            
+            for i, marker_id in enumerate(marker_ids.flatten()):
+                corners = marker_corners[i][0]
+                
+                center_x = int(np.mean(corners[:, 0]))
+                center_y = int(np.mean(corners[:, 1]))
+                
+                min_x = int(np.min(corners[:, 0]))
+                max_x = int(np.max(corners[:, 0]))
+                min_y = int(np.min(corners[:, 1]))
+                max_y = int(np.max(corners[:, 1]))
+                
+                marker_width = max_x - min_x
+                marker_height = max_y - min_y
+                marker_size = int(min(marker_width, marker_height))
+                
+                thickness = max(8, marker_size // 6)
+                
+                print(f"Drawing on marker {marker_id} at ({center_x}, {center_y}), size: {marker_width}x{marker_height}")
+                
+                if marker_id % 2 == 1:
+                    color = (0, 0, 255)
+                    
+                    p0, p1, p2, p3 = corners.astype(int)
+                    cv2.line(image, p0, p2, color, thickness)
+                    cv2.line(image, p1, p3, color, thickness)
+
+                    print(f"Drew red X on marker {marker_id}")
+                elif marker_id > 0 and marker_id % 2 == 0:
+                    color = (255, 0, 0)
+                    rect = cv2.minAreaRect(corners)
+                    (cx, cy), (w, h), angle = rect
+                    cv2.ellipse(image, (int(cx), int(cy)),
+                                (int(w/2), int(h/2)),
+                                angle, 0, 360, color, thickness)
+
+                    print(f"Drew blue O on marker {marker_id}")
+                    
+                cv2.polylines(image, [corners.astype(int)], True, (0, 255, 0), 2)
+        else:
+            print("No ArUco markers detected in image")
+            
+    except Exception as e:
+        print(f"Error in annotate_markers_with_symbols: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    return image
+
 
 # ────────────────────────────────
 # Helper functions from main.py
@@ -225,15 +308,19 @@ class CameraThread(QThread):
         super().__init__()
         self._running = True
         self._interval = 1.0 / fps
-        self._last_cv_frame = None  # Сохраняем последний CV кадр
+        self._last_cv_frame = None
 
     def run(self):
         while self._running:
             try:
                 cv_img = capture_image()
-                self._last_cv_frame = cv_img  # Сохраняем CV кадр
-                # Convert numpy array to QImage
-                rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+                self._last_cv_frame = cv_img
+                
+                # Annotate markers with symbols for display (X and O)
+                annotated_img = annotate_markers_with_symbols(cv_img.copy())
+                
+                # Convert annotated image to QImage for display
+                rgb_image = cv2.cvtColor(annotated_img, cv2.COLOR_BGR2RGB)
                 h, w, ch = rgb_image.shape
                 bytes_per_line = ch * w
                 qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
@@ -252,7 +339,6 @@ class CameraThread(QThread):
             time.sleep(self._interval)
 
     def get_last_frame(self):
-        """Возвращает последний захваченный CV кадр."""
         import copy
         return copy.deepcopy(self._last_cv_frame) if self._last_cv_frame is not None else None
 
@@ -262,8 +348,6 @@ class CameraThread(QThread):
 
 
 class RobotThread(QThread):
-    """Фоновый поток: калибровка и робот‑ходы."""
-
     predicted_move = Signal(int, int)
     move_done = Signal(int, int, str)
     calibration_done = Signal()
@@ -277,7 +361,7 @@ class RobotThread(QThread):
         self._running = True
         self.base = base
         self.base_cyclic = base_cyclic
-        self.camera_thread = camera_thread  # Ссылка на камеру
+        self.camera_thread = camera_thread
         self.tracker = ArucoTracker(marker_size=MARKER_SIZE, ema_alpha=1.0)
 
     # API -------------------------------------------------------------
@@ -444,33 +528,76 @@ class GameView(QWidget):
     def __init__(self):
         super().__init__()
         self.frame = QLabel(alignment=Qt.AlignCenter)
-        self.frame.setFixedSize(400, 400)
+        self.frame.setMinimumSize(400, 300)
+        self.frame.setStyleSheet("border: 1px solid gray;")
+
+        right_panel = QWidget()
+        right_panel.setFixedWidth(300)
+        right_panel.setStyleSheet("""
+            QWidget {
+                background-color: #2b2b2b;
+                border: 1px solid #444;
+                border-radius: 5px;
+            }
+            QPushButton {
+                background-color: #3c3c3c;
+                color: white;
+                border: 1px solid #555;
+                border-radius: 3px;
+                padding: 8px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #4a4a4a;
+            }
+            QPushButton:pressed {
+                background-color: #333;
+            }
+            QPushButton:disabled {
+                background-color: #2a2a2a;
+                color: #666;
+            }
+        """)
 
         self.cells: List[List[QLabel]] = [[QLabel() for _ in range(3)] for _ in range(3)]
         grid = QGridLayout()
+        grid.setSpacing(2)
         for r in range(3):
             for c in range(3):
                 lbl = self.cells[r][c]
                 lbl.setFixedSize(80, 80)
                 lbl.setAlignment(Qt.AlignCenter)
-                lbl.setStyleSheet("font‑size:32pt;border:1px solid gray;")
+                lbl.setStyleSheet("""
+                    font-size: 32pt;
+                    border: 2px solid #555;
+                    background-color: #1e1e1e;
+                    color: white;
+                    border-radius: 5px;
+                """)
                 grid.addWidget(lbl, r, c)
         
         btn = QPushButton("Give up")
+        btn.setFixedHeight(40)
         btn.clicked.connect(self.surrender_clicked)
         
         self.done_btn = QPushButton("My turn is done")
+        self.done_btn.setFixedHeight(40)
         self.done_btn.clicked.connect(self.human_move_done)
 
-        right = QVBoxLayout()
-        right.addLayout(grid)
-        right.addWidget(btn)
-        right.addWidget(self.done_btn)
-        right.addStretch(1)
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.addStretch(1)
+        right_layout.addLayout(grid)
+        right_layout.addStretch(1)
+        right_layout.addWidget(btn)
+        right_layout.addWidget(self.done_btn)
+        right_layout.addStretch(1)
 
         main = QGridLayout(self)
+        main.setContentsMargins(5, 5, 5, 5)
         main.addWidget(self.frame, 0, 0)
-        main.addLayout(right, 0, 1)
+        main.addWidget(right_panel, 0, 1)
+        main.setColumnStretch(0, 1)
+        main.setColumnStretch(1, 0)
 
     def update_board(
         self, board: List[List[str]], hint: Optional[Tuple[int, int]] = None
@@ -481,21 +608,52 @@ class GameView(QWidget):
                 s = board[r][c]
                 if s == "X":
                     lbl.setText("X")
-                    lbl.setStyleSheet("font‑size:32pt;color:red;border:1px solid gray;")
+                    lbl.setStyleSheet("""
+                        font-size: 32pt;
+                        color: #ff4444;
+                        border: 2px solid #555;
+                        background-color: #1e1e1e;
+                        border-radius: 5px;
+                    """)
                 elif s == "O":
                     lbl.setText("O")
-                    lbl.setStyleSheet("font‑size:32pt;color:blue;border:1px solid gray;")
+                    lbl.setStyleSheet("""
+                        font-size: 32pt;
+                        color: #4488ff;
+                        border: 2px solid #555;
+                        background-color: #1e1e1e;
+                        border-radius: 5px;
+                    """)
                 else:
                     lbl.setText("")
-                    lbl.setStyleSheet("font‑size:32pt;border:1px solid gray;")
+                    lbl.setStyleSheet("""
+                        font-size: 32pt;
+                        border: 2px solid #555;
+                        background-color: #1e1e1e;
+                        color: white;
+                        border-radius: 5px;
+                    """)
         if hint and not board[hint[0]][hint[1]]:
             r, c = hint
             lbl = self.cells[r][c]
             lbl.setText("•")
-            lbl.setStyleSheet("font‑size:32pt;color:gray;border:1px solid gray;")
+            lbl.setStyleSheet("""
+                font-size: 32pt;
+                color: #888;
+                border: 2px solid #777;
+                background-color: #2a2a2a;
+                border-radius: 5px;
+            """)
 
     def update_frame(self, frame: QImage):
-        self.frame.setPixmap(QPixmap.fromImage(frame.scaled(self.frame.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)))
+        scaled_pixmap = QPixmap.fromImage(
+            frame.scaled(
+                self.frame.size(), 
+                Qt.KeepAspectRatio, 
+                Qt.SmoothTransformation
+            )
+        )
+        self.frame.setPixmap(scaled_pixmap)
 
 
 # ────────────────────────────────

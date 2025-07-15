@@ -4,11 +4,12 @@ import sys
 import random
 import queue
 import time
+import os
 from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, Signal, QObject, QThread
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread
 from PySide6.QtGui import QImage, QPixmap, QPainter, QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -21,15 +22,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
 )
 
-from arm_lib import (
-    DeviceConnection,
-    BaseClient,
-    BaseCyclicClient,
-    move_to_home,
-    set_gripper,
-    cartesian_action_movement,
-)
-from aprli_tag_new import ArucoTracker, capture_image, get_session_logger
+from aprli_tag_new import ArucoTracker, get_session_logger
 from tic_tac_toe import find_best_move
 
 # ────────────────────────────────
@@ -43,8 +36,17 @@ TILE_SIZE = 0.05
 HOME_SHIFT = 0.024
 
 # ────────────────────────────────
-# Helper function for marker annotation
+# Mock functions for arm control
 # ────────────────────────────────
+
+def mock_move_to_home():
+    time.sleep(0.1)
+
+def mock_set_gripper(value):
+    time.sleep(0.1)
+
+def mock_cartesian_action_movement(**kwargs):
+    time.sleep(0.1)
 
 def annotate_markers_with_symbols(image):
     print(f"[DEBUG] annotate_markers_with_symbols called with image shape: {image.shape}")
@@ -65,7 +67,7 @@ def annotate_markers_with_symbols(image):
         
         try:
             detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
-            marker_corners, marker_ids, _ = detector.detectMarkers(gray)
+            marker_corners, marker_ids, _ = detector.detectMarkers(gray)  # Используем обработанное изображение
             print(f"[DEBUG] Used new ArUco API")
         except AttributeError:
             marker_corners, marker_ids, _ = cv2.aruco.detectMarkers(gray, aruco_dict, parameters=parameters)
@@ -105,7 +107,7 @@ def annotate_markers_with_symbols(image):
                     print(f"Drew red X on marker {marker_id}")
                 elif marker_id > 0 and marker_id % 2 == 0:
                     color = (255, 0, 0)
-                    rect = cv2.minAreaRect(corners)
+                    rect = cv2.minAreaRect(corners)      # ((cx, cy), (w, h), angle)
                     (cx, cy), (w, h), angle = rect
                     cv2.ellipse(image, (int(cx), int(cy)),
                                 (int(w/2), int(h/2)),
@@ -124,11 +126,33 @@ def annotate_markers_with_symbols(image):
     
     return image
 
+def mock_capture_image():
+    time.sleep(5)
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    meow_path = os.path.join(current_dir, "meow.jpg")
+    
+    if os.path.exists(meow_path):
+        img = cv2.imread(meow_path)
+        print(f"[DEBUG] Loaded image from {meow_path}, shape: {img.shape}")
+        
+        tracker = ArucoTracker(marker_size=MARKER_SIZE, ema_alpha=1.0)
+        detections = tracker.detect_markers(img)
+        print(f"[DEBUG] ArucoTracker found {len(detections)} markers: {[mid for mid, _ in detections]}")
+    
+        img = annotate_markers_with_symbols(img)
+        img = cv2.rotate(img, cv2.ROTATE_180)
+        
+        return img
+    else:
+        print(f"[DEBUG] File not found: {meow_path}")
+        
+        img = np.zeros((480, 640, 3), dtype=np.uint8)
+        cv2.putText(img, "meow.jpg not found", (200, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        return img
 
 # ────────────────────────────────
 # Helper functions from main.py
 # ────────────────────────────────
-
 
 def pose_to_cell(pose):
     print(pose)
@@ -156,10 +180,8 @@ def get_marker_type(marker_id):
     return None
 
 
-def base_position(base, base_cyclic, dx=0, dy=0, dtz=0):
-    cartesian_action_movement(
-        base, base_cyclic, x=-0.05 + dx, y=-0.15 + dy, z=-0.4, tx=90, tz=dtz
-    )
+def base_position(dx=0, dy=0, dtz=0):
+    mock_cartesian_action_movement(x=-0.05 + dx, y=-0.15 + dy, z=-0.4, tx=90, tz=dtz)
 
 
 def find_marker_by_type(
@@ -313,14 +335,10 @@ class CameraThread(QThread):
     def run(self):
         while self._running:
             try:
-                cv_img = capture_image()
+                cv_img = mock_capture_image()
                 self._last_cv_frame = cv_img
                 
-                # Annotate markers with symbols for display (X and O)
-                annotated_img = annotate_markers_with_symbols(cv_img.copy())
-                
-                # Convert annotated image to QImage for display
-                rgb_image = cv2.cvtColor(annotated_img, cv2.COLOR_BGR2RGB)
+                rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
                 h, w, ch = rgb_image.shape
                 bytes_per_line = ch * w
                 qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
@@ -352,15 +370,11 @@ class RobotThread(QThread):
     move_done = Signal(int, int, str)
     calibration_done = Signal()
 
-    def __init__(
-        self, model: TicTacToeModel, base: BaseClient, base_cyclic: BaseCyclicClient, camera_thread: CameraThread
-    ):
+    def __init__(self, model: TicTacToeModel, camera_thread: CameraThread):
         super().__init__()
         self.model = model
         self._q: queue.Queue[tuple[str, Optional[str]]] = queue.Queue()
         self._running = True
-        self.base = base
-        self.base_cyclic = base_cyclic
         self.camera_thread = camera_thread
         self.tracker = ArucoTracker(marker_size=MARKER_SIZE, ema_alpha=1.0)
 
@@ -391,10 +405,10 @@ class RobotThread(QThread):
     # internals -------------------------------------------------------
 
     def _do_calibration(self):
-        move_to_home(self.base)
-        base_position(self.base, self.base_cyclic, dy=0.18, dx=0.03)
-        cartesian_action_movement(self.base, self.base_cyclic, tz=25)
-        set_gripper(self.base, 80)
+        mock_move_to_home()
+        base_position(dy=0.18, dx=0.03)
+        mock_cartesian_action_movement(tz=25)
+        mock_set_gripper(80)
         self.calibration_done.emit()
 
     def _do_move(self, symbol: str):
@@ -433,33 +447,32 @@ class RobotThread(QThread):
                 self.model.game_over.emit(winner)
             return
 
-        # 4. Execute move
+        # 4. Execute move (mock version)
         r, c = move
         self.predicted_move.emit(r, c)
 
-        # Pick and place sequence
-        base_position(self.base, self.base_cyclic, dy=0.18, dx=0.03)
-        cartesian_action_movement(self.base, self.base_cyclic, tz=25)
-        cartesian_action_movement(self.base, self.base_cyclic, x=x, y=y, tz=180 - abs(yaw))
+        base_position(dy=0.18, dx=0.03)
+        mock_cartesian_action_movement(tz=25)
+        mock_cartesian_action_movement(x=x, y=y, tz=180 - abs(yaw))
 
-        set_gripper(self.base, 30)
-        cartesian_action_movement(self.base, self.base_cyclic, z=-0.05)
-        set_gripper(self.base, 70)
-        cartesian_action_movement(self.base, self.base_cyclic, z=0.1)
+        mock_set_gripper(30)
+        mock_cartesian_action_movement(z=-0.05)
+        mock_set_gripper(70)
+        mock_cartesian_action_movement(z=0.1)
 
-        move_to_home(self.base)
-        base_position(self.base, self.base_cyclic, dy=0.18, dx=0.03)
-        cartesian_action_movement(self.base, self.base_cyclic, tz=25)
+        mock_move_to_home()
+        base_position(dy=0.18, dx=0.03)
+        mock_cartesian_action_movement(tz=25)
 
         target_x = -(HOME_SHIFT + CELL * c + CELL / 2)
         target_y = -(HOME_SHIFT + CELL * r + CELL / 2)
 
-        cartesian_action_movement(self.base, self.base_cyclic, x=target_x)
-        cartesian_action_movement(self.base, self.base_cyclic, y=target_y)
+        mock_cartesian_action_movement(x=target_x)
+        mock_cartesian_action_movement(y=target_y)
 
-        cartesian_action_movement(self.base, self.base_cyclic, z=-0.03)
-        set_gripper(self.base, 50)
-        move_to_home(self.base)
+        mock_cartesian_action_movement(z=-0.03)
+        mock_set_gripper(50)
+        mock_move_to_home()
 
         # 5. Update model
         try:
@@ -674,36 +687,21 @@ class AppController(QObject):
         for w in (self.menu, self.camera, self.game):
             self.stack.addWidget(w)
 
-        # Robot Connection
-        self.device_connection = None
-        self.router = None
-        self.robot_connected = False
-        try:
-            self.device_connection = DeviceConnection.createTcpConnection()
-            self.router = self.device_connection.__enter__()  # Initialize the connection
-            base = BaseClient(self.router)
-            base_cyclic = BaseCyclicClient(self.router)
-            self.robot_connected = True
-        except Exception as e:
-            QMessageBox.critical(None, "Connection Error", f"Failed to connect to robot: {e}")
-            base, base_cyclic = None, None
+        self.robot_connected = True
 
         # threads
         self.cam_thread = CameraThread()
-        if self.robot_connected:
-            self.robot_thread = RobotThread(self.model, base, base_cyclic, self.cam_thread)
+        self.robot_thread = RobotThread(self.model, self.cam_thread)
 
         self.cam_thread.start()
-        if self.robot_connected:
-            self.robot_thread.start()
+        self.robot_thread.start()
 
         # connect threads → views
         self.cam_thread.frame_ready.connect(self.camera.update_frame)
         self.cam_thread.frame_ready.connect(self.game.update_frame)
-        if self.robot_connected:
-            self.robot_thread.predicted_move.connect(self._on_hint)
-            self.robot_thread.calibration_done.connect(self._calibration_done)
-            self.robot_thread.move_done.connect(self._on_robot_move_done)
+        self.robot_thread.predicted_move.connect(self._on_hint)
+        self.robot_thread.calibration_done.connect(self._calibration_done)
+        self.robot_thread.move_done.connect(self._on_robot_move_done)
 
         # model → views
         self.model.board_changed.connect(self._refresh_board)
@@ -722,21 +720,16 @@ class AppController(QObject):
         self.human_symbol = "X"
         self.robot_symbol = "O"
 
-        if not self.robot_connected:
-            self.menu.set_play_enabled(False)
-            self.menu.cfg_btn.setEnabled(False)
-
     # ─── Calibration -------------------------------------------------
 
     def run_calibration(self):
-        if not self.robot_connected: return
         self.menu.set_play_enabled(False)
         self.robot_thread.calibrate()
         QMessageBox.information(None, "Calibrate", "Robot is moving to grab pose…")
 
     def _calibration_done(self):
         QMessageBox.information(None, "Calibrate", "Place the board and press OK.")
-        move_to_home(self.robot_thread.base)
+        mock_move_to_home()  # Mock версия
         self.menu.set_play_enabled(True)
         self.stack.setCurrentWidget(self.menu)
 
@@ -758,7 +751,6 @@ class AppController(QObject):
         return random.choice(["X", "O"])
 
     def start_game(self):
-        if not self.robot_connected: return
         self.human_symbol = self._ask_player_symbol()
         self.robot_symbol = "O" if self.human_symbol == "X" else "X"
 
@@ -774,7 +766,6 @@ class AppController(QObject):
             self.game.done_btn.setEnabled(True)
             QMessageBox.information(None, "Your turn", "Place your marker and press 'My turn is done'")
 
-
     def trigger_robot_move(self):
         self.game.done_btn.setEnabled(False)
         self.robot_thread.make_move(self.robot_symbol)
@@ -783,7 +774,6 @@ class AppController(QObject):
         if not self.model.check_winner():
             self.game.done_btn.setEnabled(True)
             QMessageBox.information(None, "Your turn", "Place your marker and press 'My turn is done'")
-
 
     def end_game(self):
         self.model.reset()
@@ -807,10 +797,7 @@ class AppController(QObject):
 
     def shutdown(self):
         self.cam_thread.stop()
-        if self.robot_connected:
-            self.robot_thread.stop()
-        if self.device_connection:
-            self.device_connection.__exit__(None, None, None)
+        self.robot_thread.stop()
 
 
 # ────────────────────────────────
@@ -818,14 +805,14 @@ class AppController(QObject):
 # ────────────────────────────────
 
 
-def main() -> None:  # noqa: D401
+def main():
     app = QApplication(sys.argv)
     stack = QStackedWidget()
     controller = AppController(stack)
 
     app.aboutToQuit.connect(controller.shutdown)
 
-    stack.setWindowTitle("Tic Tac Toe Robot UI")
+    stack.setWindowTitle("Tic Tac Toe Robot UI (Mock)")
     stack.resize(920, 520)
     stack.show()
     sys.exit(app.exec())

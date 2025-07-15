@@ -18,7 +18,7 @@ def capture_calibration_images(num_images=25, calib_dir="calibration_images"):
         print(f"Saved: {output_path}")
     print(f"Capture complete! Now run the calibration.")
 
-def calibrate_camera_chessboard(calib_dir="calibration_images", checkerboard=(8, 6), square_size_mm=31):
+def calibrate_camera_chessboard(calib_dir="calibration_images", checkerboard=(8, 5), square_size_mm=None):
     """Calibrate the camera using a chessboard."""
     objp = np.zeros((checkerboard[0] * checkerboard[1], 3), np.float32)
     objp[:, :2] = np.mgrid[0:checkerboard[0], 0:checkerboard[1]].T.reshape(-1, 2)

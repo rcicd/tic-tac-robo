@@ -403,13 +403,22 @@ class RobotThread(QThread):
         if img is None:
             print("[ERROR] No frame available from camera")
             return
-
+    
         # 1. Find robot's marker to pick up.
         try:
-            marker_id, x, y, z, yaw = find_marker_by_type(
+            marker_id, x, y, _, yaw = find_marker_by_type(
                 self.tracker, img, marker_type=symbol
             )
             print(f"Marker is found {marker_id} of type {symbol}")
+
+            detections = self.tracker.detect_markers(img)
+            home_yaw = None
+            for mid, data in detections:
+                if mid == 0:  # home marker id
+                    home_yaw = data["orientation"][2]
+                    print(f"Home marker yaw: {home_yaw:.1f}°")
+                    break
+
         except RuntimeError as e:
             print(f"[ERROR] {e}")
             return
@@ -437,10 +446,33 @@ class RobotThread(QThread):
         r, c = move
         self.predicted_move.emit(r, c)
 
+        local_motion = np.array([x, y])
+        print(local_motion)
+        print(np.rad2deg(home_yaw))
+        adj_home_yaw = home_yaw
+        adj_home_yaw += np.pi / 2  # Adjust home yaw to match robot's orientation
+        adj_home_yaw *= -1
+        rotation_matrix = np.array([
+            [np.cos(adj_home_yaw), -np.sin(adj_home_yaw)],
+            [np.sin(adj_home_yaw),  np.cos(adj_home_yaw)],
+        ])
+
+        motion = rotation_matrix @ local_motion
+        print(motion)  
+        # print(yaw)
+        # exit()
+
+        global_yaw = yaw + np.rad2deg(home_yaw)
+        while global_yaw > 180:
+            global_yaw -= 360
+        while global_yaw <= -180:
+            global_yaw += 360
+
         # Pick and place sequence
         base_position(self.base, self.base_cyclic, dy=0.18, dx=0.03)
         cartesian_action_movement(self.base, self.base_cyclic, tz=25)
-        cartesian_action_movement(self.base, self.base_cyclic, x=x, y=y, tz=180 - abs(yaw))
+        cartesian_action_movement(self.base, self.base_cyclic, x=motion[0], y=motion[1])
+        cartesian_action_movement(self.base, self.base_cyclic, tz=global_yaw)
 
         set_gripper(self.base, 30)
         cartesian_action_movement(self.base, self.base_cyclic, z=-0.05)
@@ -452,12 +484,14 @@ class RobotThread(QThread):
         cartesian_action_movement(self.base, self.base_cyclic, tz=25)
 
         target_x = -(HOME_SHIFT + CELL * c + CELL / 2)
-        target_y = -(HOME_SHIFT + CELL * r + CELL / 2)
+        target_y = -(HOME_SHIFT + CELL * r + CELL / 2) + 0.02
+        local_motion = [target_x, target_y]
+        motion = rotation_matrix @ local_motion
+        cartesian_action_movement(self.base, self.base_cyclic, x=motion[0])
+        cartesian_action_movement(self.base, self.base_cyclic, y=motion[1])
+        cartesian_action_movement(self.base, self.base_cyclic, tz = np.rad2deg(-home_yaw))
 
-        cartesian_action_movement(self.base, self.base_cyclic, x=target_x)
-        cartesian_action_movement(self.base, self.base_cyclic, y=target_y)
-
-        cartesian_action_movement(self.base, self.base_cyclic, z=-0.03)
+        cartesian_action_movement(self.base, self.base_cyclic, z=-0.045)
         set_gripper(self.base, 50)
         move_to_home(self.base)
 

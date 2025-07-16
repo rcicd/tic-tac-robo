@@ -46,8 +46,8 @@ HOME_SHIFT = 0.024
 # Helper function for marker annotation
 # ────────────────────────────────
 
-def annotate_markers_with_symbols(image):
-    print(f"[DEBUG] annotate_markers_with_symbols called with image shape: {image.shape}")
+def annotate_markers_with_symbols(image, target_marker_id=None):
+    print(f"[DEBUG] annotate_markers_with_symbols called with image shape: {image.shape}, target_marker_id: {target_marker_id}")
     try:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         gray = cv2.equalizeHist(gray)
@@ -113,7 +113,15 @@ def annotate_markers_with_symbols(image):
 
                     print(f"Drew blue O on marker {marker_id}")
                     
-                cv2.polylines(image, [corners.astype(int)], True, (0, 255, 0), 2)
+                border_thickness = 2
+                border_color = (0, 255, 0)
+                
+                if target_marker_id is not None and marker_id == target_marker_id:
+                    border_thickness = 12
+                    border_color = (0, 255, 0)
+                    print(f"Drawing thick green border for target marker {marker_id}")
+                
+                cv2.polylines(image, [corners.astype(int)], True, border_color, border_thickness)
         else:
             print("No ArUco markers detected in image")
             
@@ -309,6 +317,7 @@ class CameraThread(QThread):
         self._running = True
         self._interval = 1.0 / fps
         self._last_cv_frame = None
+        self._target_marker_id = None
 
     def run(self):
         while self._running:
@@ -317,7 +326,7 @@ class CameraThread(QThread):
                 self._last_cv_frame = cv_img
                 
                 # Annotate markers with symbols for display (X and O)
-                annotated_img = annotate_markers_with_symbols(cv_img.copy())
+                annotated_img = annotate_markers_with_symbols(cv_img.copy(), self._target_marker_id)
                 
                 # Convert annotated image to QImage for display
                 rgb_image = cv2.cvtColor(annotated_img, cv2.COLOR_BGR2RGB)
@@ -342,6 +351,9 @@ class CameraThread(QThread):
         import copy
         return copy.deepcopy(self._last_cv_frame) if self._last_cv_frame is not None else None
 
+    def set_target_marker(self, marker_id: Optional[int]):
+        self._target_marker_id = marker_id
+
     def stop(self):
         self._running = False
         self.wait()
@@ -351,6 +363,7 @@ class RobotThread(QThread):
     predicted_move = Signal(int, int)
     move_done = Signal(int, int, str)
     calibration_done = Signal()
+    target_marker_changed = Signal(int)
 
     def __init__(
         self, model: TicTacToeModel, base: BaseClient, base_cyclic: BaseCyclicClient, camera_thread: CameraThread
@@ -410,6 +423,8 @@ class RobotThread(QThread):
                 self.tracker, img, marker_type=symbol
             )
             print(f"Marker is found {marker_id} of type {symbol}")
+            
+            self.target_marker_changed.emit(marker_id)
 
             detections = self.tracker.detect_markers(img)
             home_yaw = None
@@ -421,6 +436,7 @@ class RobotThread(QThread):
 
         except RuntimeError as e:
             print(f"[ERROR] {e}")
+            self.target_marker_changed.emit(-1)
             return
 
         # 2. Read board state
@@ -437,6 +453,7 @@ class RobotThread(QThread):
 
         if move is None:
             print("No valid move found for the robot.")
+            self.target_marker_changed.emit(-1)
             winner = self.model.check_winner()
             if winner:
                 self.model.game_over.emit(winner)
@@ -499,8 +516,10 @@ class RobotThread(QThread):
         try:
             self.model.place(symbol, r, c)
             self.move_done.emit(r, c, symbol)
+            self.target_marker_changed.emit(-1)
         except ValueError as e:
             print(f"Error placing marker in model: {e}")
+            self.target_marker_changed.emit(-1)
 
 
 # ────────────────────────────────
@@ -738,6 +757,7 @@ class AppController(QObject):
             self.robot_thread.predicted_move.connect(self._on_hint)
             self.robot_thread.calibration_done.connect(self._calibration_done)
             self.robot_thread.move_done.connect(self._on_robot_move_done)
+            self.robot_thread.target_marker_changed.connect(self._on_target_marker_changed)
 
         # model → views
         self.model.board_changed.connect(self._refresh_board)
@@ -753,6 +773,7 @@ class AppController(QObject):
 
         # state
         self._hint_pos: Optional[Tuple[int, int]] = None
+        self._target_marker_id: Optional[int] = None
         self.human_symbol = "X"
         self.robot_symbol = "O"
 
@@ -821,6 +842,8 @@ class AppController(QObject):
 
     def end_game(self):
         self.model.reset()
+        self._target_marker_id = None
+        self.cam_thread.set_target_marker(None)
         self.stack.setCurrentWidget(self.menu)
 
     # ─── Helpers -----------------------------------------------------
@@ -831,6 +854,16 @@ class AppController(QObject):
     def _on_hint(self, r: int, c: int):
         self._hint_pos = (r, c)
         self._refresh_board()
+
+    def _on_target_marker_changed(self, marker_id: int):
+
+        if marker_id == -1:
+            self._target_marker_id = None
+        else:
+            self._target_marker_id = marker_id
+        
+        self.cam_thread.set_target_marker(self._target_marker_id)
+        print(f"[DEBUG] Target marker set to: {self._target_marker_id}")
 
     def _game_over(self, winner: str):
         msg = "Draw!" if winner == "Draw" else f"Winner: {winner}"

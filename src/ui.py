@@ -417,8 +417,37 @@ class RobotThread(QThread):
         if img is None:
             print("[ERROR] No frame available from camera")
             return
-    
-        # 1. Find robot's marker to pick up.
+
+        # 1. Read board state
+        board_from_cam = read_board(img, self.tracker)
+        board_from_cam = [[c.replace(".", "") for c in row] for row in board_from_cam]
+
+        # Sync model with camera state
+        self.model.board = board_from_cam
+        self.model.board_changed.emit()
+        time.sleep(0.1)  # Allow UI to update
+
+        # 2. Check for game over conditions
+        winner = self.model.check_winner()
+        if winner:
+            print(f"Game is already over. Winner: {winner}")
+            self.model.game_over.emit(winner)
+            self.target_marker_changed.emit(-1)
+            return
+
+        # 3. Find best move
+        move = find_best_move(board_from_cam, symbol)
+
+        if move is None:
+            print("No valid move found for the robot.")
+            self.target_marker_changed.emit(-1)
+            # Check again for game over (might be a draw now)
+            winner = self.model.check_winner()
+            if winner:
+                self.model.game_over.emit(winner)
+            return
+
+        # 4. Find robot's marker to pick up
         try:
             marker_id, x, y, _, yaw = find_marker_by_type(
                 self.tracker, img, marker_type=symbol
@@ -440,27 +469,7 @@ class RobotThread(QThread):
             self.target_marker_changed.emit(-1)
             return
 
-        # 2. Read board state
-        board_from_cam = read_board(img, self.tracker)
-        board_from_cam = [[c.replace(".", "") for c in row] for row in board_from_cam]
-
-        # Sync model with camera state
-        self.model.board = board_from_cam
-        self.model.board_changed.emit()
-        time.sleep(0.1)  # Allow UI to update
-
-        # 3. Find best move
-        move = find_best_move(board_from_cam, symbol)
-
-        if move is None:
-            print("No valid move found for the robot.")
-            self.target_marker_changed.emit(-1)
-            winner = self.model.check_winner()
-            if winner:
-                self.model.game_over.emit(winner)
-            return
-
-        # 4. Execute move
+        # 5. Execute move
         r, c = move
         self.predicted_move.emit(r, c)
 
@@ -480,7 +489,7 @@ class RobotThread(QThread):
         # print(yaw)
         # exit()
 
-        global_yaw = yaw + np.rad2deg(home_yaw)
+        global_yaw = yaw + np.rad2deg(adj_home_yaw)
         while global_yaw > 180:
             global_yaw -= 360
         while global_yaw <= -180:
@@ -493,7 +502,7 @@ class RobotThread(QThread):
         cartesian_action_movement(self.base, self.base_cyclic, tz=global_yaw)
 
         set_gripper(self.base, 30)
-        cartesian_action_movement(self.base, self.base_cyclic, z=-0.05)
+        cartesian_action_movement(self.base, self.base_cyclic, z=-0.0475)
         set_gripper(self.base, 70)
         cartesian_action_movement(self.base, self.base_cyclic, z=0.1)
 
@@ -502,7 +511,7 @@ class RobotThread(QThread):
         cartesian_action_movement(self.base, self.base_cyclic, tz=25)
 
         target_x = -(HOME_SHIFT + CELL * c + CELL / 2)
-        target_y = -(HOME_SHIFT + CELL * r + CELL / 2) + 0.02
+        target_y = -(HOME_SHIFT + CELL * r + CELL / 2)
         local_motion = [target_x, target_y]
         motion = rotation_matrix @ local_motion
         cartesian_action_movement(self.base, self.base_cyclic, x=motion[0])
@@ -513,7 +522,7 @@ class RobotThread(QThread):
         set_gripper(self.base, 50)
         move_to_home(self.base)
 
-        # 5. Update model
+        # 6. Update model
         try:
             self.model.place(symbol, r, c)
             self.move_done.emit(r, c, symbol)
@@ -738,6 +747,12 @@ class AppController(QObject):
             base = BaseClient(self.router)
             base_cyclic = BaseCyclicClient(self.router)
             self.robot_connected = True
+            
+            # Move robot to home position on startup
+            print("Moving robot to home position on startup...")
+            move_to_home(base)
+            print("Robot moved to home position successfully")
+            
         except Exception as e:
             QMessageBox.critical(None, "Connection Error", f"Failed to connect to robot: {e}")
             base, base_cyclic = None, None

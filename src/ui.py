@@ -26,6 +26,7 @@ from arm_lib import (
     BaseClient,
     BaseCyclicClient,
     move_to_home,
+    move_to_safe_position,
     set_gripper,
     cartesian_action_movement,
 )
@@ -873,6 +874,14 @@ class AppController(QObject):
     # ─── Clean‑up ----------------------------------------------------
 
     def shutdown(self):
+        # Move robot to safe position before shutdown
+        if self.robot_connected:
+            try:
+                print("Moving robot to safe position before shutdown...")
+                move_to_safe_position(self.robot_thread.base)
+            except Exception as e:
+                print(f"Error moving robot to safe position: {e}")
+        
         self.cam_thread.stop()
         if self.robot_connected:
             self.robot_thread.stop()

@@ -42,6 +42,7 @@ FIELD_SIZE = CELL * BOARD
 MARKER_SIZE = 0.04
 TILE_SIZE = 0.05
 HOME_SHIFT = 0.024
+CALIBRATION_CROSS_OFFSET = np.array([0.05, 0.0])
 
 # ────────────────────────────────
 # Helper function for marker annotation
@@ -407,6 +408,7 @@ class RobotThread(QThread):
     def _do_calibration(self):
         move_to_home(self.base)
         base_position(self.base, self.base_cyclic, dy=0.18, dx=0.03)
+        cartesian_action_movement(self.base, self.base_cyclic, z=-0.04)
         cartesian_action_movement(self.base, self.base_cyclic, tz=25)
         set_gripper(self.base, 80)
         self.calibration_done.emit()
@@ -464,9 +466,7 @@ class RobotThread(QThread):
         r, c = move
         self.predicted_move.emit(r, c)
 
-        local_motion = np.array([x, y])
-        print(local_motion)
-        print(np.rad2deg(home_yaw))
+        # Calculate the calibration offset in global coordinates
         adj_home_yaw = home_yaw
         adj_home_yaw += np.pi / 2  # Adjust home yaw to match robot's orientation
         adj_home_yaw *= -1
@@ -474,9 +474,20 @@ class RobotThread(QThread):
             [np.cos(adj_home_yaw), -np.sin(adj_home_yaw)],
             [np.sin(adj_home_yaw),  np.cos(adj_home_yaw)],
         ])
+        
+        # Apply calibration offset - robot was calibrated over cross, but coordinates are relative to home marker
+        calibration_offset_global = rotation_matrix @ CALIBRATION_CROSS_OFFSET
+        print(f"[DEBUG] Calibration offset in global coordinates: {calibration_offset_global}")
+
+        local_motion = np.array([x, y])
+        print(local_motion)
+        print(np.rad2deg(home_yaw))
 
         motion = rotation_matrix @ local_motion
-        print(motion)  
+        print(f"[DEBUG] Motion before calibration compensation: {motion}")
+        # Add calibration compensation for pickup
+        motion += calibration_offset_global
+        print(f"[DEBUG] Motion after calibration compensation: {motion}")  
         # print(yaw)
         # exit()
 
@@ -505,6 +516,10 @@ class RobotThread(QThread):
         target_y = -(HOME_SHIFT + CELL * r + CELL / 2) + 0.02
         local_motion = [target_x, target_y]
         motion = rotation_matrix @ local_motion
+        print(f"[DEBUG] Placement motion before calibration compensation: {motion}")
+        # Add calibration compensation for placement
+        motion += calibration_offset_global
+        print(f"[DEBUG] Placement motion after calibration compensation: {motion}")
         cartesian_action_movement(self.base, self.base_cyclic, x=motion[0])
         cartesian_action_movement(self.base, self.base_cyclic, y=motion[1])
         cartesian_action_movement(self.base, self.base_cyclic, tz = np.rad2deg(-home_yaw))
@@ -738,6 +753,12 @@ class AppController(QObject):
             base = BaseClient(self.router)
             base_cyclic = BaseCyclicClient(self.router)
             self.robot_connected = True
+            
+            # Move robot to home position on startup
+            print("Moving robot to home position on startup...")
+            move_to_home(base)
+            print("Robot moved to home position successfully")
+            
         except Exception as e:
             QMessageBox.critical(None, "Connection Error", f"Failed to connect to robot: {e}")
             base, base_cyclic = None, None

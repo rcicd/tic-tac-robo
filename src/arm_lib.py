@@ -125,6 +125,42 @@ def move_to_home(base):
         print("Timeout on action notification wait")
     return finished
 
+def move_to_safe_position(base):
+    """Move the robot arm to safe (retracted) position"""
+    base_servo_mode = Base_pb2.ServoingModeInformation()
+    base_servo_mode.servoing_mode = Base_pb2.SINGLE_LEVEL_SERVOING
+    base.SetServoingMode(base_servo_mode)
+    
+    # Move arm to safe (retracted) position
+    print("Moving the arm to safe (retracted) position")
+    action_type = Base_pb2.RequestedActionType()
+    action_type.action_type = Base_pb2.REACH_JOINT_ANGLES
+    action_list = base.ReadAllActions(action_type)
+    action_handle = None
+    for action in action_list.action_list:
+        if action.name == "Retract":
+            action_handle = action.handle
+
+    if action_handle == None:
+        print("Can't reach safe (retracted) position. Action 'Retract' not found")
+        return False
+
+    e = threading.Event()
+    notification_handle = base.OnNotificationActionTopic(
+        check_for_end_or_abort(e),
+        Base_pb2.NotificationOptions()
+    )
+
+    base.ExecuteActionFromReference(action_handle)
+    finished = e.wait(TIMEOUT_DURATION)
+    base.Unsubscribe(notification_handle)
+
+    if finished:
+        print("Safe (retracted) position reached")
+    else:
+        print("Timeout on action notification wait")
+    return finished
+
 def cartesian_action_movement(base, 
                               base_cyclic, 
                               x = 0, y = 0, z = 0, 

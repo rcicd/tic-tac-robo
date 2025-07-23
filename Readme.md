@@ -60,6 +60,20 @@ See `logs/README.md` for detailed information about the logging structure.
    - The robot calculates its optimal move using the minimax algorithm and performs the necessary motions to place its marker using the gripper.
    - The process repeats until the game is finished (win/draw).
 
+## Setup Instructions
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/rcicd/tic-tac-robo.git
+   cd tic-tac-robo
+   ```
+2. **Install dependencies:**
+   * You should install [pyenv](https://github.com/pyenv/pyenv) and [pyenv-virtualenv](https://github.com/pyenv/pyenv-virtualenv) to manage Python versions and virtual environments
+   * Download required [python package](https://artifactory.kinovaapps.com/artifactory/generic-public/kortex/API/2.6.0/kortex_api-2.6.0.post3-py3-none-any.whl) from kortex artifactory and put it in root of project
+3. Run following commands:
+   ```bash
+   make setup
+   make install
+   ```
 ## Usage
 
 ### 1. Camera Calibration
@@ -71,15 +85,14 @@ python calibrate_camera_chessboard.py
 ### 2. Start the Game
 Run the main program and follow on-screen instructions:
 ```bash
-python main.py
+make run
 ```
-- Select your marker (X or O)
-- Place your move and press Enter when prompted
+- Press "Play" to start a new game
+- Place your move and "Turn is done"
 - The robot will detect the game state and play its move
+- Repeat until the game ends
 
 ### 3. Playing
 - The robot reads the board state automatically between moves
-
 - Markers are placed using the robotic arm
-
-- The board size and tag sizes are assumed to be known and constant (default: cells 5x5 cm, tag size 27 mm)
+- The board size and tag sizes are assumed to be known and constant (default: cells 8x8 cm, tag size 40 mm)

@@ -292,9 +292,9 @@ class ArucoTracker:
         
         # Recommended refinements → less jitter
         self._params.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
-        self._params.cornerRefinementWinSize = 5
-        self._params.cornerRefinementMaxIterations = 50
-        self._params.cornerRefinementMinAccuracy = 0.1
+        self._params.cornerRefinementWinSize = 7
+        self._params.cornerRefinementMaxIterations = 100
+        self._params.cornerRefinementMinAccuracy = 0.05
 
         self._filter = EMAFilter(alpha=ema_alpha)
 
@@ -344,7 +344,8 @@ class ArucoTracker:
         logger.logger.debug(f"Converted to grayscale: shape={gray.shape}")
         
         # gray = cv2.fastNlMeansDenoising(gray, h=10)  # gentle denoise
-        gray = cv2.equalizeHist(gray)  # contrast stretch
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
         logger.logger.debug("Applied histogram equalization")
         
         # Save debug image
@@ -399,7 +400,7 @@ class ArucoTracker:
                 img_pts,
                 self.camera_matrix,
                 self.dist_coeffs,
-                flags=cv2.SOLVEPNP_IPPE_SQUARE,
+                flags=cv2.SOLVEPNP_SQPNP,
             )
             
             if not ok:

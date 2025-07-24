@@ -420,7 +420,23 @@ class RobotThread(QThread):
             print("[ERROR] No frame available from camera")
             return
     
-        # 1. Find robot's marker to pick up.
+        # 1. Read board state
+        board_from_cam = read_board(img, self.tracker)
+        board_from_cam = [[c.replace(".", "") for c in row] for row in board_from_cam]
+
+        # Sync model with camera state
+        self.model.board = board_from_cam
+        self.model.board_changed.emit()
+        time.sleep(0.1)  # Allow UI to update
+
+        # 2. Check if game is already over (win or draw)
+        winner = self.model.check_winner()
+        if winner:
+            print(f"Game is already over: {winner}")
+            self.model.game_over.emit(winner)
+            return
+
+        # 3. Find robot's marker to pick up.
         try:
             marker_id, x, y, _, yaw = find_marker_by_type(
                 self.tracker, img, marker_type=symbol
@@ -442,16 +458,7 @@ class RobotThread(QThread):
             self.target_marker_changed.emit(-1)
             return
 
-        # 2. Read board state
-        board_from_cam = read_board(img, self.tracker)
-        board_from_cam = [[c.replace(".", "") for c in row] for row in board_from_cam]
-
-        # Sync model with camera state
-        self.model.board = board_from_cam
-        self.model.board_changed.emit()
-        time.sleep(0.1)  # Allow UI to update
-
-        # 3. Find best move
+        # 4. Find best move
         move = find_best_move(board_from_cam, symbol)
 
         if move is None:
@@ -462,7 +469,7 @@ class RobotThread(QThread):
                 self.model.game_over.emit(winner)
             return
 
-        # 4. Execute move
+        # 5. Execute move
         r, c = move
         self.predicted_move.emit(r, c)
 
@@ -519,7 +526,7 @@ class RobotThread(QThread):
         set_gripper(self.base, 50)
         move_to_home(self.base)
 
-        # 5. Update model
+        # 6. Update model
         try:
             self.model.place(symbol, r, c)
             self.move_done.emit(r, c, symbol)

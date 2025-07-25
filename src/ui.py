@@ -492,11 +492,11 @@ class RobotThread(QThread):
         # print(yaw)
         # exit()
 
-        global_yaw = yaw + np.rad2deg(home_yaw)
-        while global_yaw > 180:
-            global_yaw -= 360
-        while global_yaw <= -180:
-            global_yaw += 360
+        global_yaw = yaw - np.rad2deg(home_yaw)
+        # while global_yaw > 180:
+        #     global_yaw -= 360
+        # while global_yaw <= -180:
+        #     global_yaw += 360
 
         # Pick and place sequence
         base_position(self.base, self.base_cyclic, dy=0.18, dx=0.03)

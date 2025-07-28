@@ -1,3 +1,7 @@
 opencv-python
 opencv-contrib-python
-PySide6
+numpy
+fastapi
+uvicorn[standard]
+websockets
+pydantic

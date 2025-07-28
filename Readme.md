@@ -80,6 +80,7 @@ See `logs/README.md` for detailed information about the logging structure.
 ### 1. Camera Calibration
 
 Before starting, calibrate your camera for best results:
+```
 make calibrate
 ```
 ### 2. Start the Game

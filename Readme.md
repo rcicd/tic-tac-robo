@@ -88,6 +88,7 @@ Run the main program and follow on-screen instructions:
 ```bash
 make run
 ```
+- Open the web interface in your browser (default: http://localhost:8000 or http://duckie-rpi-arm.local:8000 for Raspberry Pi)
 - Press "Play" to start a new game
 - Place your move and "Turn is done"
 - The robot will detect the game state and play its move

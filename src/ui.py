@@ -1,25 +1,19 @@
 from __future__ import annotations
 
-import sys
-import random
 import queue
 import time
+import threading
+import asyncio
+import base64
 from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, Signal, QObject, QThread
-from PySide6.QtGui import QImage, QPixmap, QPainter, QFont
-from PySide6.QtWidgets import (
-    QApplication,
-    QGridLayout,
-    QLabel,
-    QPushButton,
-    QStackedWidget,
-    QVBoxLayout,
-    QWidget,
-    QMessageBox,
-)
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, StreamingResponse
+from pydantic import BaseModel
+import uvicorn
+import json
 
 from arm_lib import (
     DeviceConnection,
@@ -259,21 +253,115 @@ def read_board(frame, tracker, home_id=0):
 
 
 # ────────────────────────────────
-#  Model
+# FastAPI Models
+# ────────────────────────────────
+
+class GameState(BaseModel):
+    board: List[List[str]]
+    human_symbol: str
+    robot_symbol: str
+    game_over: bool
+    winner: Optional[str] = None
+    hint: Optional[Tuple[int, int]] = None
+    robot_connected: bool
+
+class MoveRequest(BaseModel):
+    symbol: str
+
+class SymbolChoice(BaseModel):
+    symbol: str
+
+# ────────────────────────────────
+# WebSocket Connection Manager
+# ────────────────────────────────
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+        self.frame_queue: queue.Queue = queue.Queue(maxsize=5)
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def send_message(self, message: str):
+        for connection in self.active_connections:
+            try:
+                await connection.send_text(message)
+            except:
+                self.disconnect(connection)
+
+    async def send_json(self, data: dict):
+        message = json.dumps(data)
+        await self.send_message(message)
+
+    def add_frame(self, frame_data: str):
+        """Thread-safe method to add frame to queue"""
+        try:
+            if self.frame_queue.full():
+                try:
+                    self.frame_queue.get_nowait()  # Remove old frame
+                except queue.Empty:
+                    pass
+            self.frame_queue.put_nowait(frame_data)
+        except queue.Full:
+            pass
+
+    async def send_frames(self):
+        """Background task to send frames to WebSocket clients"""
+        while True:
+            try:
+                if not self.frame_queue.empty():
+                    frame_data = self.frame_queue.get_nowait()
+                    await self.send_json({
+                        "type": "frame",
+                        "data": frame_data
+                    })
+                await asyncio.sleep(0.1)  # 10 FPS
+            except Exception as e:
+                print(f"Error sending frames: {e}")
+                await asyncio.sleep(0.1)
+
+manager = ConnectionManager()
+
+# ────────────────────────────────
+#  Model (остается без изменений)
 # ────────────────────────────────
 
 
-class TicTacToeModel(QObject):
-    board_changed = Signal()
-    game_over = Signal(str)  # 'X', 'O' or 'Draw'
-
+class TicTacToeModel:
     def __init__(self):
-        super().__init__()
+        self.board_changed_callbacks = []
+        self.game_over_callbacks = []
         self.reset()
 
     def reset(self):
         self.board: List[List[str]] = [["" for _ in range(3)] for _ in range(3)]
-        self.board_changed.emit()
+        self._notify_board_changed()
+
+    def add_board_changed_callback(self, callback):
+        self.board_changed_callbacks.append(callback)
+
+    def add_game_over_callback(self, callback):
+        self.game_over_callbacks.append(callback)
+
+    def _notify_board_changed(self):
+        for callback in self.board_changed_callbacks:
+            try:
+                callback()
+            except Exception as e:
+                print(f"Error in board changed callback: {e}")
+
+    def _notify_game_over(self, winner: str):
+        for callback in self.game_over_callbacks:
+            try:
+                callback(winner)
+            except Exception as e:
+                print(f"Error in game over callback: {e}")
 
     # helpers ---------------------------------------------------------
 
@@ -300,26 +388,28 @@ class TicTacToeModel(QObject):
         if self.board[r][c]:
             raise ValueError("Cell busy")
         self.board[r][c] = s
-        self.board_changed.emit()
+        self._notify_board_changed()
         w = self.check_winner()
         if w:
-            self.game_over.emit(w)
+            self._notify_game_over(w)
 
 
 # ────────────────────────────────
-#  Worker threads
+#  Worker threads (адаптированы для FastAPI)
 # ────────────────────────────────
 
 
-class CameraThread(QThread):
-    frame_ready = Signal(QImage)
-
+class CameraThread(threading.Thread):
     def __init__(self, fps: int = 10):
-        super().__init__()
+        super().__init__(daemon=True)
         self._running = True
         self._interval = 1.0 / fps
         self._last_cv_frame = None
         self._target_marker_id = None
+        self._frame_callbacks = []
+
+    def add_frame_callback(self, callback):
+        self._frame_callbacks.append(callback)
 
     def run(self):
         while self._running:
@@ -330,23 +420,20 @@ class CameraThread(QThread):
                 # Annotate markers with symbols for display (X and O)
                 annotated_img = annotate_markers_with_symbols(cv_img.copy(), self._target_marker_id)
                 
-                # Convert annotated image to QImage for display
-                rgb_image = cv2.cvtColor(annotated_img, cv2.COLOR_BGR2RGB)
-                h, w, ch = rgb_image.shape
-                bytes_per_line = ch * w
-                qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
-                self.frame_ready.emit(qt_image)
+                # Convert frame to base64 and add to manager queue
+                _, buffer = cv2.imencode('.jpg', annotated_img)
+                frame_b64 = base64.b64encode(buffer).decode('utf-8')
+                manager.add_frame(frame_b64)
+                
+                # Notify other callbacks with the annotated frame
+                for callback in self._frame_callbacks:
+                    try:
+                        callback(annotated_img)
+                    except Exception as e:
+                        print(f"Error in frame callback: {e}")
+                    
             except Exception as e:
                 print(f"CameraThread error: {e}")
-                # Create a black image with error text
-                img = QImage(640, 480, QImage.Format_RGB888)
-                img.fill(Qt.black)
-                painter = QPainter(img)
-                painter.setPen(Qt.white)
-                painter.setFont(QFont("Sans", 12))
-                painter.drawText(img.rect(), Qt.AlignCenter, f"Camera Error: {e}")
-                painter.end()
-                self.frame_ready.emit(img)
             time.sleep(self._interval)
 
     def get_last_frame(self):
@@ -358,19 +445,13 @@ class CameraThread(QThread):
 
     def stop(self):
         self._running = False
-        self.wait()
 
 
-class RobotThread(QThread):
-    predicted_move = Signal(int, int)
-    move_done = Signal(int, int, str)
-    calibration_done = Signal()
-    target_marker_changed = Signal(int)
-
+class RobotThread(threading.Thread):
     def __init__(
-        self, model: TicTacToeModel, base: BaseClient, base_cyclic: BaseCyclicClient, camera_thread: CameraThread
+        self, model: TicTacToeModel, base, base_cyclic, camera_thread: CameraThread
     ):
-        super().__init__()
+        super().__init__(daemon=True)
         self.model = model
         self._q: queue.Queue[tuple[str, Optional[str]]] = queue.Queue()
         self._running = True
@@ -378,40 +459,93 @@ class RobotThread(QThread):
         self.base_cyclic = base_cyclic
         self.camera_thread = camera_thread
         self.tracker = ArucoTracker(marker_size=MARKER_SIZE, ema_alpha=1.0)
+        
+        # Callback lists
+        self.predicted_move_callbacks = []
+        self.move_done_callbacks = []
+        self.calibration_done_callbacks = []
+        self.target_marker_changed_callbacks = []
+
+    # Callback management
+    def add_predicted_move_callback(self, callback):
+        self.predicted_move_callbacks.append(callback)
+
+    def add_move_done_callback(self, callback):
+        self.move_done_callbacks.append(callback)
+
+    def add_calibration_done_callback(self, callback):
+        self.calibration_done_callbacks.append(callback)
+
+    def add_target_marker_changed_callback(self, callback):
+        self.target_marker_changed_callbacks.append(callback)
+
+    def _notify_predicted_move(self, r: int, c: int):
+        for callback in self.predicted_move_callbacks:
+            callback(r, c)
+
+    def _notify_move_done(self, r: int, c: int, symbol: str):
+        for callback in self.move_done_callbacks:
+            callback(r, c, symbol)
+
+    def _notify_calibration_done(self):
+        print("[DEBUG] _notify_calibration_done called")
+        for callback in self.calibration_done_callbacks:
+            print(f"[DEBUG] Calling calibration done callback: {callback}")
+            callback()
+
+    def _notify_target_marker_changed(self, marker_id: int):
+        for callback in self.target_marker_changed_callbacks:
+            callback(marker_id)
 
     # API -------------------------------------------------------------
 
     def calibrate(self):
+        print("[DEBUG] calibrate() called, adding calibrate command to queue")
         self._q.put(("calibrate", None))
+
+    def calibration_complete(self):
+        """Вызывается после подтверждения пользователем размещения доски"""
+        self._q.put(("calibration_complete", None))
 
     def make_move(self, symbol: str):
         self._q.put(("move", symbol))
 
     def stop(self):
         self._q.put(("stop", None))
-        self.wait()
 
     # loop ------------------------------------------------------------
 
     def run(self):
+        print("[DEBUG] RobotThread run() started")
         while self._running:
             cmd, arg = self._q.get()
+            print(f"[DEBUG] RobotThread received command: {cmd}")
             if cmd == "stop":
                 self._running = False
             elif cmd == "calibrate":
+                print("[DEBUG] Processing calibrate command")
                 self._do_calibration()
+            elif cmd == "calibration_complete":
+                self._do_calibration_complete()
             elif cmd == "move":
                 self._do_move(arg)  # type: ignore[arg‑type]
 
     # internals -------------------------------------------------------
 
     def _do_calibration(self):
+        print("[DEBUG] Starting calibration sequence")
         move_to_home(self.base)
         base_position(self.base, self.base_cyclic, dy=0.18, dx=0.03)
         cartesian_action_movement(self.base, self.base_cyclic, z=-0.04)
         cartesian_action_movement(self.base, self.base_cyclic, tz=25)
         set_gripper(self.base, 80)
-        self.calibration_done.emit()
+        # НЕ перемещаем руку домой автоматически - ждем подтверждения от пользователя
+        print("[DEBUG] Calibration sequence completed, calling _notify_calibration_done")
+        self._notify_calibration_done()
+
+    def _do_calibration_complete(self):
+        """Завершаем калибровку - возвращаем руку домой"""
+        move_to_home(self.base)
 
     def _do_move(self, symbol: str):
         # 0. Get current frame from camera
@@ -426,14 +560,14 @@ class RobotThread(QThread):
 
         # Sync model with camera state
         self.model.board = board_from_cam
-        self.model.board_changed.emit()
+        self.model._notify_board_changed()
         time.sleep(0.1)  # Allow UI to update
 
         # 2. Check if game is already over (win or draw)
         winner = self.model.check_winner()
         if winner:
             print(f"Game is already over: {winner}")
-            self.model.game_over.emit(winner)
+            self.model._notify_game_over(winner)
             return
 
         # 3. Find robot's marker to pick up.
@@ -443,7 +577,7 @@ class RobotThread(QThread):
             )
             print(f"Marker is found {marker_id} of type {symbol}")
             
-            self.target_marker_changed.emit(marker_id)
+            self._notify_target_marker_changed(marker_id)
 
             detections = self.tracker.detect_markers(img)
             home_yaw = None
@@ -455,7 +589,7 @@ class RobotThread(QThread):
 
         except RuntimeError as e:
             print(f"[ERROR] {e}")
-            self.target_marker_changed.emit(-1)
+            self._notify_target_marker_changed(-1)
             return
 
         # 4. Find best move
@@ -463,15 +597,15 @@ class RobotThread(QThread):
 
         if move is None:
             print("No valid move found for the robot.")
-            self.target_marker_changed.emit(-1)
+            self._notify_target_marker_changed(-1)
             winner = self.model.check_winner()
             if winner:
-                self.model.game_over.emit(winner)
+                self.model._notify_game_over(winner)
             return
 
         # 5. Execute move
         r, c = move
-        self.predicted_move.emit(r, c)
+        self._notify_predicted_move(r, c)
 
         # Calculate the calibration offset in global coordinates
         adj_home_yaw = home_yaw
@@ -529,218 +663,26 @@ class RobotThread(QThread):
         # 6. Update model
         try:
             self.model.place(symbol, r, c)
-            self.move_done.emit(r, c, symbol)
-            self.target_marker_changed.emit(-1)
+            self._notify_move_done(r, c, symbol)
+            self._notify_target_marker_changed(-1)
         except ValueError as e:
             print(f"Error placing marker in model: {e}")
-            self.target_marker_changed.emit(-1)
+            self._notify_target_marker_changed(-1)
 
 
 # ────────────────────────────────
-#  Views
+#  FastAPI App Controller
 # ────────────────────────────────
 
+app = FastAPI(title="Tic Tac Toe Robot")
 
-class MainMenuView(QWidget):
-    play_clicked = Signal()
-    cam_clicked = Signal()
-    cfg_clicked = Signal()
-
+class AppController:
     def __init__(self):
-        super().__init__()
-        box = QVBoxLayout(self)
-
-        self.play_btn = QPushButton("Play")
-        self.play_btn.setFixedHeight(50)
-        self.play_btn.clicked.connect(self.play_clicked)
-
-        self.cam_btn = QPushButton("Check camera")
-        self.cam_btn.setFixedHeight(50)
-        self.cam_btn.clicked.connect(self.cam_clicked)
-
-        self.cfg_btn = QPushButton("Configure")
-        self.cfg_btn.setFixedHeight(50)
-        self.cfg_btn.clicked.connect(self.cfg_clicked)
-
-        box.addWidget(self.play_btn)
-        box.addWidget(self.cam_btn)
-        box.addWidget(self.cfg_btn)
-        box.addStretch(1)
-
-    def set_play_enabled(self, state: bool):
-        self.play_btn.setEnabled(state)
-
-
-class CameraView(QWidget):
-    back_clicked = Signal()
-
-    def __init__(self):
-        super().__init__()
-        self.img = QLabel(alignment=Qt.AlignCenter)
-        self.img.setMinimumSize(640, 480)
-        back = QPushButton("Back")
-        back.clicked.connect(self.back_clicked)
-        lay = QVBoxLayout(self)
-        lay.addWidget(self.img)
-        lay.addWidget(back)
-
-    def update_frame(self, frame: QImage):
-        self.img.setPixmap(QPixmap.fromImage(frame.scaled(self.img.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)))
-
-
-class GameView(QWidget):
-    surrender_clicked = Signal()
-    human_move_done = Signal()
-
-    def __init__(self):
-        super().__init__()
-        self.frame = QLabel(alignment=Qt.AlignCenter)
-        self.frame.setMinimumSize(400, 300)
-        self.frame.setStyleSheet("border: 1px solid gray;")
-
-        right_panel = QWidget()
-        right_panel.setFixedWidth(300)
-        right_panel.setStyleSheet("""
-            QWidget {
-                background-color: #2b2b2b;
-                border: 1px solid #444;
-                border-radius: 5px;
-            }
-            QPushButton {
-                background-color: #3c3c3c;
-                color: white;
-                border: 1px solid #555;
-                border-radius: 3px;
-                padding: 8px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #4a4a4a;
-            }
-            QPushButton:pressed {
-                background-color: #333;
-            }
-            QPushButton:disabled {
-                background-color: #2a2a2a;
-                color: #666;
-            }
-        """)
-
-        self.cells: List[List[QLabel]] = [[QLabel() for _ in range(3)] for _ in range(3)]
-        grid = QGridLayout()
-        grid.setSpacing(2)
-        for r in range(3):
-            for c in range(3):
-                lbl = self.cells[r][c]
-                lbl.setFixedSize(80, 80)
-                lbl.setAlignment(Qt.AlignCenter)
-                lbl.setStyleSheet("""
-                    font-size: 32pt;
-                    border: 2px solid #555;
-                    background-color: #1e1e1e;
-                    color: white;
-                    border-radius: 5px;
-                """)
-                grid.addWidget(lbl, r, c)
-        
-        btn = QPushButton("Give up")
-        btn.setFixedHeight(40)
-        btn.clicked.connect(self.surrender_clicked)
-        
-        self.done_btn = QPushButton("My turn is done")
-        self.done_btn.setFixedHeight(40)
-        self.done_btn.clicked.connect(self.human_move_done)
-
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.addStretch(1)
-        right_layout.addLayout(grid)
-        right_layout.addStretch(1)
-        right_layout.addWidget(btn)
-        right_layout.addWidget(self.done_btn)
-        right_layout.addStretch(1)
-
-        main = QGridLayout(self)
-        main.setContentsMargins(5, 5, 5, 5)
-        main.addWidget(self.frame, 0, 0)
-        main.addWidget(right_panel, 0, 1)
-        main.setColumnStretch(0, 1)
-        main.setColumnStretch(1, 0)
-
-    def update_board(
-        self, board: List[List[str]], hint: Optional[Tuple[int, int]] = None
-    ):
-        for r in range(3):
-            for c in range(3):
-                lbl = self.cells[r][c]
-                s = board[r][c]
-                if s == "X":
-                    lbl.setText("X")
-                    lbl.setStyleSheet("""
-                        font-size: 32pt;
-                        color: #ff4444;
-                        border: 2px solid #555;
-                        background-color: #1e1e1e;
-                        border-radius: 5px;
-                    """)
-                elif s == "O":
-                    lbl.setText("O")
-                    lbl.setStyleSheet("""
-                        font-size: 32pt;
-                        color: #4488ff;
-                        border: 2px solid #555;
-                        background-color: #1e1e1e;
-                        border-radius: 5px;
-                    """)
-                else:
-                    lbl.setText("")
-                    lbl.setStyleSheet("""
-                        font-size: 32pt;
-                        border: 2px solid #555;
-                        background-color: #1e1e1e;
-                        color: white;
-                        border-radius: 5px;
-                    """)
-        if hint and not board[hint[0]][hint[1]]:
-            r, c = hint
-            lbl = self.cells[r][c]
-            lbl.setText("•")
-            lbl.setStyleSheet("""
-                font-size: 32pt;
-                color: #888;
-                border: 2px solid #777;
-                background-color: #2a2a2a;
-                border-radius: 5px;
-            """)
-
-    def update_frame(self, frame: QImage):
-        scaled_pixmap = QPixmap.fromImage(
-            frame.scaled(
-                self.frame.size(), 
-                Qt.KeepAspectRatio, 
-                Qt.SmoothTransformation
-            )
-        )
-        self.frame.setPixmap(scaled_pixmap)
-
-
-# ────────────────────────────────
-#  Controller
-# ────────────────────────────────
-
-
-class AppController(QObject):
-    def __init__(self, stack: QStackedWidget):
-        super().__init__()
-        self.stack = stack
         self.model = TicTacToeModel()
-
-        # views
-        self.menu = MainMenuView()
-        self.camera = CameraView()
-        self.game = GameView()
-        for w in (self.menu, self.camera, self.game):
-            self.stack.addWidget(w)
-
+        
+        # Очередь для сообщений из других потоков
+        self._message_queue = queue.Queue()
+        
         # Robot Connection
         self.device_connection = None
         self.router = None
@@ -758,7 +700,7 @@ class AppController(QObject):
             print("Robot moved to home position successfully")
             
         except Exception as e:
-            QMessageBox.critical(None, "Connection Error", f"Failed to connect to robot: {e}")
+            print(f"Failed to connect to robot: {e}")
             base, base_cyclic = None, None
 
         # threads
@@ -766,131 +708,175 @@ class AppController(QObject):
         if self.robot_connected:
             self.robot_thread = RobotThread(self.model, base, base_cyclic, self.cam_thread)
 
+        # Setup callbacks
+        self._setup_callbacks()
+
+        # Start threads
         self.cam_thread.start()
         if self.robot_connected:
             self.robot_thread.start()
-
-        # connect threads → views
-        self.cam_thread.frame_ready.connect(self.camera.update_frame)
-        self.cam_thread.frame_ready.connect(self.game.update_frame)
-        if self.robot_connected:
-            self.robot_thread.predicted_move.connect(self._on_hint)
-            self.robot_thread.calibration_done.connect(self._calibration_done)
-            self.robot_thread.move_done.connect(self._on_robot_move_done)
-            self.robot_thread.target_marker_changed.connect(self._on_target_marker_changed)
-
-        # model → views
-        self.model.board_changed.connect(self._refresh_board)
-        self.model.game_over.connect(self._game_over)
-
-        # menu buttons
-        self.menu.play_clicked.connect(self.start_game)
-        self.menu.cam_clicked.connect(lambda: self.stack.setCurrentWidget(self.camera))
-        self.menu.cfg_clicked.connect(self.run_calibration)
-        self.camera.back_clicked.connect(lambda: self.stack.setCurrentWidget(self.menu))
-        self.game.surrender_clicked.connect(self.end_game)
-        self.game.human_move_done.connect(self.trigger_robot_move)
 
         # state
         self._hint_pos: Optional[Tuple[int, int]] = None
         self._target_marker_id: Optional[int] = None
         self.human_symbol = "X"
         self.robot_symbol = "O"
+        self.current_view = "menu"  # menu, camera, game
+        self.game_over_flag = False
+        self.winner = None
 
-        if not self.robot_connected:
-            self.menu.set_play_enabled(False)
-            self.menu.cfg_btn.setEnabled(False)
+    def set_main_loop(self, loop):
+        self._main_loop = loop
 
-    # ─── Calibration -------------------------------------------------
+    async def process_message_queue(self):
+        while True:
+            try:
+                if not self._message_queue.empty():
+                    message = self._message_queue.get_nowait()
+                    print(f"[DEBUG] Processing message from queue: {message}")
+                    
+                    if message.get("type") == "board_changed":
+                        await self._send_game_state()
+                    else:
+                        await manager.send_json(message)
+                        
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                print(f"Error processing message queue: {e}")
+                await asyncio.sleep(0.1)
+
+    def _setup_callbacks(self):
+        self.model.add_board_changed_callback(self._on_board_changed_sync)
+        self.model.add_game_over_callback(self._on_game_over_sync)
+        
+        if self.robot_connected:
+            # Connect robot callbacks
+            self.robot_thread.add_predicted_move_callback(self._on_predicted_move_sync)
+            self.robot_thread.add_calibration_done_callback(self._on_calibration_done_sync)
+            self.robot_thread.add_move_done_callback(self._on_robot_move_done_sync)
+            self.robot_thread.add_target_marker_changed_callback(self._on_target_marker_changed_sync)
+
+    def _on_board_changed_sync(self):
+        try:
+            self._message_queue.put_nowait({"type": "board_changed"})
+        except queue.Full:
+            pass
+
+    def _on_game_over_sync(self, winner: str):
+        self.game_over_flag = True
+        self.winner = winner
+        try:
+            self._message_queue.put_nowait({
+                "type": "game_over",
+                "winner": winner,
+                "message": "Draw!" if winner == "Draw" else f"Winner: {winner}"
+            })
+        except queue.Full:
+            pass
+
+    def _on_predicted_move_sync(self, r: int, c: int):
+        self._hint_pos = (r, c)
+
+    def _on_calibration_done_sync(self):
+        print("[DEBUG] _on_calibration_done_sync called - sending calibration_done message")
+        try:
+            self._message_queue.put_nowait({
+                "type": "calibration_done",
+                "message": "Place the board and press OK."
+            })
+            print("[DEBUG] Message added to queue successfully")
+        except queue.Full:
+            print("[ERROR] Message queue is full")
+
+    def _on_robot_move_done_sync(self, r: int, c: int, symbol: str):
+        if not self.model.check_winner():
+            try:
+                self._message_queue.put_nowait({
+                    "type": "human_turn",
+                    "message": "Place your marker and press 'My turn is done'"
+                })
+            except queue.Full:
+                pass
+
+    def _on_target_marker_changed_sync(self, marker_id: int):
+        self._target_marker_id = None if marker_id == -1 else marker_id
+        self.cam_thread.set_target_marker(self._target_marker_id)
+
+    async def _send_game_state(self):
+        state = GameState(
+            board=self.model.board,
+            human_symbol=self.human_symbol,
+            robot_symbol=self.robot_symbol,
+            game_over=self.game_over_flag,
+            winner=self.winner,
+            hint=self._hint_pos,
+            robot_connected=self.robot_connected
+        )
+        await manager.send_json({
+            "type": "game_state",
+            "data": state.dict()
+        })
+
+    # ─── API Methods -------------------------------------------------
+
+    def get_game_state(self) -> GameState:
+        return GameState(
+            board=self.model.board,
+            human_symbol=self.human_symbol,
+            robot_symbol=self.robot_symbol,
+            game_over=self.game_over_flag,
+            winner=self.winner,
+            hint=self._hint_pos,
+            robot_connected=self.robot_connected
+        )
 
     def run_calibration(self):
-        if not self.robot_connected: return
-        self.menu.set_play_enabled(False)
+        print(f"[DEBUG] run_calibration called, robot_connected: {self.robot_connected}")
+        if not self.robot_connected: 
+            return {"error": "Robot not connected"}
+        print("[DEBUG] Calling robot_thread.calibrate()")
         self.robot_thread.calibrate()
-        QMessageBox.information(None, "Calibrate", "Robot is moving to grab pose…")
+        return {"message": "Robot is moving to grab pose…"}
 
-    def _calibration_done(self):
-        QMessageBox.information(None, "Calibrate", "Place the board and press OK.")
-        move_to_home(self.robot_thread.base)
-        self.menu.set_play_enabled(True)
-        self.stack.setCurrentWidget(self.menu)
+    def complete_calibration(self):
+        if not self.robot_connected:
+            return {"error": "Robot not connected"}
+        self.robot_thread.calibration_complete()
+        return {"message": "Calibration completed, robot returned home"}
 
-    # ─── Gameplay ----------------------------------------------------
-
-    def _ask_player_symbol(self) -> str:
-        dlg = QMessageBox()
-        dlg.setWindowTitle("Choose your symbol")
-        dlg.setText("Play as:")
-        x_btn = dlg.addButton("X", QMessageBox.AcceptRole)
-        o_btn = dlg.addButton("O", QMessageBox.AcceptRole)
-        dlg.addButton("Random", QMessageBox.AcceptRole)
-        dlg.exec()
-        clicked = dlg.clickedButton()
-        if clicked == x_btn:
-            return "X"
-        if clicked == o_btn:
-            return "O"
-        return random.choice(["X", "O"])
-
-    def start_game(self):
-        if not self.robot_connected: return
-        self.human_symbol = self._ask_player_symbol()
-        self.robot_symbol = "O" if self.human_symbol == "X" else "X"
-
+    def start_game(self, human_symbol: str):
+        if not self.robot_connected: 
+            return {"error": "Robot not connected"}
+        
+        self.human_symbol = human_symbol
+        self.robot_symbol = "O" if human_symbol == "X" else "X"
+        
         self.model.reset()
         self._hint_pos = None
-        self._refresh_board()
-        self.stack.setCurrentWidget(self.game)
+        self.game_over_flag = False
+        self.winner = None
+        self.current_view = "game"
 
         if self.robot_symbol == "X":
-            self.game.done_btn.setEnabled(False)
             self.robot_thread.make_move(self.robot_symbol)
+            return {"message": "Robot is making the first move"}
         else:
-            self.game.done_btn.setEnabled(True)
-            QMessageBox.information(None, "Your turn", "Place your marker and press 'My turn is done'")
-
+            return {"message": "Your turn! Place your marker and press 'My turn is done'"}
 
     def trigger_robot_move(self):
-        self.game.done_btn.setEnabled(False)
+        if not self.robot_connected:
+            return {"error": "Robot not connected"}
         self.robot_thread.make_move(self.robot_symbol)
-
-    def _on_robot_move_done(self, r: int, c: int, symbol: str):
-        if not self.model.check_winner():
-            self.game.done_btn.setEnabled(True)
-            QMessageBox.information(None, "Your turn", "Place your marker and press 'My turn is done'")
-
+        return {"message": "Robot is making a move"}
 
     def end_game(self):
         self.model.reset()
         self._target_marker_id = None
         self.cam_thread.set_target_marker(None)
-        self.stack.setCurrentWidget(self.menu)
-
-    # ─── Helpers -----------------------------------------------------
-
-    def _refresh_board(self):
-        self.game.update_board(self.model.board, self._hint_pos)
-
-    def _on_hint(self, r: int, c: int):
-        self._hint_pos = (r, c)
-        self._refresh_board()
-
-    def _on_target_marker_changed(self, marker_id: int):
-
-        if marker_id == -1:
-            self._target_marker_id = None
-        else:
-            self._target_marker_id = marker_id
-        
-        self.cam_thread.set_target_marker(self._target_marker_id)
-        print(f"[DEBUG] Target marker set to: {self._target_marker_id}")
-
-    def _game_over(self, winner: str):
-        msg = "Draw!" if winner == "Draw" else f"Winner: {winner}"
-        QMessageBox.information(None, "Game over", msg)
-        self.end_game()
-
-    # ─── Clean‑up ----------------------------------------------------
+        self.current_view = "menu"
+        self.game_over_flag = False
+        self.winner = None
+        return {"message": "Game ended"}
 
     def shutdown(self):
         # Move robot to safe position before shutdown
@@ -907,24 +893,413 @@ class AppController(QObject):
         if self.device_connection:
             self.device_connection.__exit__(None, None, None)
 
+# Global controller instance
+controller = AppController()
+
+# ────────────────────────────────
+#  FastAPI Routes
+# ────────────────────────────────
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(manager.send_frames())
+    asyncio.create_task(controller.process_message_queue())
+
+@app.get("/", response_class=HTMLResponse)
+async def read_root():
+    return """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Tic Tac Toe Robot</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #1e1e1e;
+            color: white;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: flex;
+            gap: 20px;
+        }
+        .left-panel {
+            flex: 1;
+            min-height: 600px;
+        }
+        .right-panel {
+            width: 300px;
+            background-color: #2b2b2b;
+            border: 1px solid #444;
+            border-radius: 5px;
+            padding: 20px;
+        }
+        .video-container {
+            width: 100%;
+            height: 400px;
+            background-color: #000;
+            border: 1px solid gray;
+            border-radius: 5px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+        }
+        .board {
+            display: grid;
+            grid-template-columns: repeat(3, 80px);
+            grid-template-rows: repeat(3, 80px);
+            gap: 2px;
+            margin: 20px 0;
+            justify-content: center;
+        }
+        .cell {
+            width: 80px;
+            height: 80px;
+            background-color: #1e1e1e;
+            border: 2px solid #555;
+            border-radius: 5px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 32px;
+            font-weight: bold;
+        }
+        .cell.x { color: #ff4444; }
+        .cell.o { color: #4488ff; }
+        .cell.hint { color: #888; background-color: #2a2a2a; border-color: #777; }
+        button {
+            background-color: #3c3c3c;
+            color: white;
+            border: 1px solid #555;
+            border-radius: 3px;
+            padding: 8px 16px;
+            font-weight: bold;
+            cursor: pointer;
+            width: 100%;
+            margin: 5px 0;
+        }
+        button:hover { background-color: #4a4a4a; }
+        button:disabled { background-color: #2a2a2a; color: #666; cursor: not-allowed; }
+        .menu {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            align-items: center;
+            justify-content: center;
+            height: 400px;
+        }
+        .hidden { display: none; }
+        #messages {
+            background-color: #1e1e1e;
+            border: 1px solid #555;
+            border-radius: 3px;
+            padding: 10px;
+            margin: 10px 0;
+            min-height: 50px;
+            max-height: 150px;
+            overflow-y: auto;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="left-panel">
+            <!-- Menu View -->
+            <div id="menu-view" class="menu">
+                <h1>Tic Tac Toe Robot</h1>
+                <button onclick="showSymbolChoice()">Play</button>
+                <button onclick="showCamera()">Check Camera</button>
+                <button onclick="calibrate()">Configure</button>
+            </div>
+
+            <!-- Camera View -->
+            <div id="camera-view" class="hidden">
+                <h2>Camera View</h2>
+                <div class="video-container" id="camera-container">
+                    <img id="camera-frame" style="max-width: 100%; max-height: 100%;" />
+                </div>
+                <button onclick="showMenu()">Back</button>
+            </div>
+
+            <!-- Game View -->
+            <div id="game-view" class="hidden">
+                <h2>Game</h2>
+                <div class="video-container" id="game-camera-container">
+                    <img id="game-camera-frame" style="max-width: 100%; max-height: 100%;" />
+                </div>
+            </div>
+        </div>
+
+        <div class="right-panel">
+            <div id="game-controls" class="hidden">
+                <div class="board" id="board"></div>
+                <button onclick="humanMoveDone()">My turn is done</button>
+                <button onclick="endGame()">Give up</button>
+            </div>
+            <div id="messages"></div>
+        </div>
+    </div>
+
+    <!-- Symbol Choice Modal -->
+    <div id="symbol-modal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 1000;">
+        <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #2b2b2b; padding: 30px; border-radius: 10px; text-align: center;">
+            <h3>Choose your symbol</h3>
+            <button onclick="startGame('X')" style="margin: 5px;">X</button>
+            <button onclick="startGame('O')" style="margin: 5px;">O</button>
+            <button onclick="startGame(Math.random() > 0.5 ? 'X' : 'O')" style="margin: 5px;">Random</button>
+        </div>
+    </div>
+
+    <!-- Calibration Modal -->
+    <div id="calibration-modal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 1000;">
+        <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #2b2b2b; padding: 30px; border-radius: 10px; text-align: center; max-width: 400px;">
+            <h3>Calibration</h3>
+            <p id="calibration-message">Press OK when calibration is done</p>
+            <button onclick="completeCalibration()">OK</button>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let currentView = 'menu';
+
+        function connectWebSocket() {
+            ws = new WebSocket(`ws://${window.location.host}/ws`);
+            
+            ws.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                handleWebSocketMessage(data);
+            };
+            
+            ws.onclose = function() {
+                setTimeout(connectWebSocket, 1000);
+            };
+        }
+
+        function handleWebSocketMessage(data) {
+            console.log('[DEBUG] Received WebSocket message:', data);
+            if (data.type === 'frame') {
+                const img1 = document.getElementById('camera-frame');
+                const img2 = document.getElementById('game-camera-frame');
+                if (img1) img1.src = 'data:image/jpeg;base64,' + data.data;
+                if (img2) img2.src = 'data:image/jpeg;base64,' + data.data;
+            } else if (data.type === 'game_state') {
+                updateGameBoard(data.data);
+            } else if (data.type === 'game_over') {
+                addMessage('Game Over: ' + data.message);
+                setTimeout(() => showMenu(), 2000);
+            } else if (data.type === 'calibration_done') {
+                console.log('[DEBUG] Received calibration_done message, showing modal');
+                // Показываем модальное окно калибровки
+                showCalibrationModal();
+                addMessage(data.message || 'Calibration ready - please confirm board placement');
+            } else if (data.type === 'human_turn') {
+                addMessage(data.message);
+            }
+        }
+
+        function updateGameBoard(gameState) {
+            const board = document.getElementById('board');
+            if (!board) return;
+            
+            board.innerHTML = '';
+            
+            for (let r = 0; r < 3; r++) {
+                for (let c = 0; c < 3; c++) {
+                    const cell = document.createElement('div');
+                    cell.className = 'cell';
+                    
+                    const value = gameState.board[r][c];
+                    if (value === 'X') {
+                        cell.textContent = 'X';
+                        cell.classList.add('x');
+                    } else if (value === 'O') {
+                        cell.textContent = 'O';
+                        cell.classList.add('o');
+                    } else if (gameState.hint && gameState.hint[0] === r && gameState.hint[1] === c) {
+                        cell.textContent = '•';
+                        cell.classList.add('hint');
+                    }
+                    
+                    board.appendChild(cell);
+                }
+            }
+        }
+
+        function addMessage(message) {
+            const messages = document.getElementById('messages');
+            messages.innerHTML += '<div>' + message + '</div>';
+            messages.scrollTop = messages.scrollHeight;
+        }
+
+        function showMenu() {
+            document.getElementById('menu-view').classList.remove('hidden');
+            document.getElementById('camera-view').classList.add('hidden');
+            document.getElementById('game-view').classList.add('hidden');
+            document.getElementById('game-controls').classList.add('hidden');
+            currentView = 'menu';
+        }
+
+        function showCamera() {
+            document.getElementById('menu-view').classList.add('hidden');
+            document.getElementById('camera-view').classList.remove('hidden');
+            document.getElementById('game-view').classList.add('hidden');
+            document.getElementById('game-controls').classList.add('hidden');
+            currentView = 'camera';
+        }
+
+        function showGame() {
+            document.getElementById('menu-view').classList.add('hidden');
+            document.getElementById('camera-view').classList.add('hidden');
+            document.getElementById('game-view').classList.remove('hidden');
+            document.getElementById('game-controls').classList.remove('hidden');
+            currentView = 'game';
+        }
+
+        function showSymbolChoice() {
+            document.getElementById('symbol-modal').style.display = 'block';
+        }
+
+        function hideSymbolChoice() {
+            document.getElementById('symbol-modal').style.display = 'none';
+        }
+
+        function showCalibrationModal() {
+            console.log('[DEBUG] showCalibrationModal called');
+            const modal = document.getElementById('calibration-modal');
+            if (modal) {
+                modal.style.display = 'block';
+                console.log('[DEBUG] Modal display set to block');
+            } else {
+                console.error('[ERROR] calibration-modal element not found');
+            }
+        }
+
+        function hideCalibrationModal() {
+            document.getElementById('calibration-modal').style.display = 'none';
+        }
+
+        async function startGame(symbol) {
+            hideSymbolChoice();
+            const response = await fetch('/start-game', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({symbol: symbol})
+            });
+            const result = await response.json();
+            addMessage(result.message || result.error);
+            if (!result.error) {
+                showGame();
+            }
+        }
+
+        async function calibrate() {
+            const response = await fetch('/calibrate', {method: 'POST'});
+            const result = await response.json();
+            if (result.error) {
+                addMessage(result.error);
+            } else {
+                addMessage(result.message);
+            }
+            // Модальное окно появится автоматически когда рука достигнет позиции калибровки
+        }
+
+        async function completeCalibration() {
+            const response = await fetch('/calibrate-complete', {method: 'POST'});
+            const result = await response.json();
+            addMessage(result.message || result.error);
+            hideCalibrationModal();
+        }
+
+        async function humanMoveDone() {
+            const response = await fetch('/human-move-done', {method: 'POST'});
+            const result = await response.json();
+            addMessage(result.message || result.error);
+        }
+
+        async function endGame() {
+            const response = await fetch('/end-game', {method: 'POST'});
+            const result = await response.json();
+            addMessage(result.message || result.error);
+            showMenu();
+        }
+
+        // Initialize
+        connectWebSocket();
+        addMessage('Connected to robot interface');
+    </script>
+</body>
+</html>
+    """
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
+@app.get("/game-state")
+async def get_game_state():
+    return controller.get_game_state()
+
+@app.post("/start-game")
+async def start_game(choice: SymbolChoice):
+    result = controller.start_game(choice.symbol)
+    return result
+
+@app.post("/calibrate")
+async def calibrate():
+    result = controller.run_calibration()
+    return result
+
+@app.post("/calibrate-complete")
+async def calibrate_complete():
+    result = controller.complete_calibration()
+    return result
+
+@app.post("/human-move-done")
+async def human_move_done():
+    result = controller.trigger_robot_move()
+    return result
+
+@app.post("/end-game")
+async def end_game():
+    result = controller.end_game()
+    return result
+
+@app.get("/camera-stream")
+async def camera_stream():
+    def generate():
+        while True:
+            frame = controller.cam_thread.get_last_frame()
+            if frame is not None:
+                annotated_img = annotate_markers_with_symbols(frame.copy(), controller._target_marker_id)
+                _, buffer = cv2.imencode('.jpg', annotated_img)
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+            time.sleep(0.1)
+    
+    return StreamingResponse(generate(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 # ────────────────────────────────
 #  Entry‑point
 # ────────────────────────────────
 
-
-def main() -> None:  # noqa: D401
-    app = QApplication(sys.argv)
-    stack = QStackedWidget()
-    controller = AppController(stack)
-
-    app.aboutToQuit.connect(controller.shutdown)
-
-    stack.setWindowTitle("Tic Tac Toe Robot UI")
-    stack.resize(920, 520)
-    stack.show()
-    sys.exit(app.exec())
-
+def main() -> None:
+    import atexit
+    atexit.register(controller.shutdown)
+    
+    print("Starting Tic Tac Toe Robot Web Interface...")
+    print("Open http://duckie-rpi-arm.local:8000 in your browser")
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 
 if __name__ == "__main__":
     main()

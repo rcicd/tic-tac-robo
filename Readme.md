@@ -74,13 +74,13 @@ See `logs/README.md` for detailed information about the logging structure.
    make setup
    make install
    ```
+4. print on A3 this [game board](masterpiece.png)
 ## Usage
 
 ### 1. Camera Calibration
 
 Before starting, calibrate your camera for best results:
-```bash
-python calibrate_camera_chessboard.py
+make calibrate
 ```
 ### 2. Start the Game
 Run the main program and follow on-screen instructions:

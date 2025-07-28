@@ -24,7 +24,10 @@ install: setup
 	@echo "🔧 Installing wheel..."
 	$(PIP_BIN) install $(WHEEL_NAME)
 
-run:
+calibrate: install
+	$(PYTHON_BIN) src/calibrate_camera_chessboard.py
+
+run: install
 	$(PYTHON_BIN) src/ui.py
 
 clean:

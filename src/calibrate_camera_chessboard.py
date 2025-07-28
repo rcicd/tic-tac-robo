@@ -8,14 +8,45 @@ def capture_calibration_images(num_images=25, calib_dir="calibration_images"):
     """Capture images for camera calibration using a chessboard."""
     if not os.path.exists(calib_dir):
         os.makedirs(calib_dir)
+    
+    # Check if rpicam-jpeg is available
+    try:
+        subprocess.run(["rpicam-jpeg", "--help"], capture_output=True, check=True)
+        use_rpicam = True
+        print("Using rpicam-jpeg for image capture")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        use_rpicam = False
+        print("rpicam-jpeg not found, using OpenCV camera")
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            print("Error: Could not open camera")
+            return
+    
     print("Prepare the chessboard and press Enter to start capturing...")
     input()
+    
     for i in range(num_images):
         print(f"Capturing image {i+1}/{num_images}. Move the board to a new position and press Enter...")
         input()
         output_path = f"{calib_dir}/calib_{i+1:02d}.jpg"
-        subprocess.run(["rpicam-jpeg", "--output", output_path, "--timeout", "100", "--vflip"], check=True)
+        
+        if use_rpicam:
+            subprocess.run(["rpicam-jpeg", "--output", output_path, "--timeout", "100", "--vflip"], check=True)
+        else:
+            ret, frame = cap.read()
+            if ret:
+                # Flip vertically to match rpicam behavior
+                frame = cv2.flip(frame, 0)
+                cv2.imwrite(output_path, frame)
+            else:
+                print(f"Failed to capture image {i+1}")
+                continue
+        
         print(f"Saved: {output_path}")
+    
+    if not use_rpicam:
+        cap.release()
+    
     print(f"Capture complete! Now run the calibration.")
 
 def calibrate_camera_chessboard(calib_dir="calibration_images", checkerboard=(8, 5), square_size_mm=None):

@@ -571,6 +571,7 @@ class RobotThread(threading.Thread):
         img = self.camera_thread.get_last_frame()
         if img is None:
             print("[ERROR] No frame available from camera")
+            self._notify_robot_move_failed("No camera frame available")
             return
     
         # 1. Read board state
@@ -582,14 +583,29 @@ class RobotThread(threading.Thread):
         self.model._notify_board_changed()
         time.sleep(0.1)  # Allow UI to update
 
-        # 2. Check if game is already over (win or draw)
+        # 2. Check if game is already over (win or draw) - enhanced check
         winner = self.model.check_winner()
         if winner:
-            print(f"Game is already over: {winner}")
+            print(f"[DEBUG] Game is already over: {winner}. Robot will not make a move.")
+            # Reset robot making move flag and notify game over
+            self._notify_robot_move_failed("")  # Empty message to reset flag without error
             self.model._notify_game_over(winner)
             return
 
-        # 3. Find robot's marker to pick up with limited attempts
+        # 3. Count available markers before attempting move
+        x_count = sum(row.count('X') for row in board_from_cam)
+        o_count = sum(row.count('O') for row in board_from_cam)
+        
+        # Check if robot has any markers left (assuming max 5 X markers and 4 O markers)
+        if (symbol == 'X' and x_count >= 5) or (symbol == 'O' and o_count >= 4):
+            print(f"[WARNING] No more {symbol} markers available on board")
+            self._notify_robot_move_failed(f"No {symbol} markers available for robot move")
+            # Check if this results in a draw
+            if len(self.model.available_moves()) == 0:
+                self.model._notify_game_over("Draw")
+            return
+
+        # 4. Find robot's marker to pick up with limited attempts
         marker_found = False
         max_attempts = 10
         attempt = 0
@@ -633,7 +649,7 @@ class RobotThread(threading.Thread):
                     self._notify_robot_move_failed("Could not find robot marker")
                     return
 
-        # 4. Find best move
+        # 5. Find best move
         move = find_best_move(board_from_cam, symbol)
 
         if move is None:
@@ -645,7 +661,7 @@ class RobotThread(threading.Thread):
                 self.model._notify_game_over(winner)
             return
 
-        # 5. Execute move
+        # 6. Execute move
         r, c = move
         self._notify_predicted_move(r, c)
 
@@ -702,7 +718,7 @@ class RobotThread(threading.Thread):
         set_gripper(self.base, 50)
         move_to_home(self.base)
 
-        # 6. Update model
+        # 7. Update model
         try:
             # Save previous game state before making the move
             was_game_over = self.model.check_winner() is not None
@@ -848,6 +864,7 @@ class AppController:
 
     def _on_robot_move_done_sync(self, r: int, c: int, symbol: str):
         self.robot_making_move = False
+        # Only send human turn message if game is not over
         if not self.model.check_winner():
             try:
                 self._message_queue.put_nowait({
@@ -938,6 +955,27 @@ class AppController:
         self.winner = None
         self.robot_making_move = False
         self.current_view = "game"
+
+        # Check current board state before starting
+        img = self.cam_thread.get_last_frame()
+        if img is not None:
+            try:
+                board_from_cam = read_board(img, self.robot_thread.tracker)
+                board_from_cam = [[c.replace(".", "") for c in row] for row in board_from_cam]
+                
+                # Update model with current board state
+                self.model.board = board_from_cam
+                
+                # Check if game is already over before starting
+                winner = self.model.check_winner()
+                if winner:
+                    self.game_over_flag = True
+                    self.winner = winner
+                    self.model._notify_game_over(winner)
+                    return {"error": f"Game already finished: {winner}"}
+                    
+            except Exception as e:
+                print(f"[ERROR] Failed to read initial board state: {e}")
 
         if self.robot_symbol == "X":
             self.robot_making_move = True
@@ -1130,8 +1168,9 @@ async def read_root():
     </div>
 
     <!-- Symbol Choice Modal -->
-    <div id="symbol-modal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 1000;">
-        <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #2b2b2b; padding: 30px; border-radius: 10px; text-align: center;">
+    <div id="symbol-modal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 1000;" onclick="hideSymbolChoice()">
+        <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #2b2b2b; padding: 30px; border-radius: 10px; text-align: center; max-width: 400px; position: relative;" onclick="event.stopPropagation()">
+            <button onclick="hideSymbolChoice()" style="position: absolute; top: 10px; right: 10px; background: transparent; border: none; color: white; font-size: 20px; cursor: pointer; width: 30px; height: 30px; border-radius: 50%; display: flex; align-items: center; justify-content: center;">&times;</button>
             <h3>Choose your symbol</h3>
             <button onclick="startGame('X')" style="margin: 5px;">X</button>
             <button onclick="startGame('O')" style="margin: 5px;">O</button>
@@ -1209,11 +1248,15 @@ async def read_root():
             } else if (data.type === 'robot_move_started') {
                 addMessage(data.message);
             } else if (data.type === 'robot_move_failed') {
-                addMessage(data.message);
-                // If robot failed due to missing markers, show special handling
-                if (data.message.includes('Could not find robot marker') || 
-                    data.message.includes('No valid moves available')) {
-                    showGameOverModal("Robot cannot continue: " + data.message);
+                // Only show message if it's not empty (empty means game was already over)
+                if (data.message && data.message.trim() !== '') {
+                    addMessage(data.message);
+                    // If robot failed due to missing markers, show special handling
+                    if (data.message.includes('Could not find robot marker') || 
+                        data.message.includes('No valid moves available') ||
+                        data.message.includes('No') && data.message.includes('markers available')) {
+                        showGameOverModal("Robot cannot continue: " + data.message);
+                    }
                 }
             }
         }
@@ -1385,6 +1428,18 @@ async def read_root():
         }
 
         async function humanMoveDone() {
+            // Immediately disable buttons to prevent multiple clicks
+            const humanMoveDoneBtn = document.querySelector('button[onclick="humanMoveDone()"]');
+            const giveUpBtn = document.querySelector('button[onclick="endGame()"]');
+            
+            if (humanMoveDoneBtn) {
+                humanMoveDoneBtn.disabled = true;
+                humanMoveDoneBtn.textContent = 'Processing...';
+            }
+            if (giveUpBtn) {
+                giveUpBtn.disabled = true;
+            }
+            
             const response = await fetch('/human-move-done', {method: 'POST'});
             const result = await response.json();
             addMessage(result.message || result.error);

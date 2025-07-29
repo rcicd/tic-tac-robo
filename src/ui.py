@@ -264,6 +264,7 @@ class GameState(BaseModel):
     winner: Optional[str] = None
     hint: Optional[Tuple[int, int]] = None
     robot_connected: bool
+    robot_making_move: bool
 
 class MoveRequest(BaseModel):
     symbol: str
@@ -465,6 +466,8 @@ class RobotThread(threading.Thread):
         self.move_done_callbacks = []
         self.calibration_done_callbacks = []
         self.target_marker_changed_callbacks = []
+        self.robot_move_started_callbacks = []
+        self.robot_move_failed_callbacks = []
 
     # Callback management
     def add_predicted_move_callback(self, callback):
@@ -478,6 +481,12 @@ class RobotThread(threading.Thread):
 
     def add_target_marker_changed_callback(self, callback):
         self.target_marker_changed_callbacks.append(callback)
+
+    def add_robot_move_started_callback(self, callback):
+        self.robot_move_started_callbacks.append(callback)
+
+    def add_robot_move_failed_callback(self, callback):
+        self.robot_move_failed_callbacks.append(callback)
 
     def _notify_predicted_move(self, r: int, c: int):
         for callback in self.predicted_move_callbacks:
@@ -496,6 +505,14 @@ class RobotThread(threading.Thread):
     def _notify_target_marker_changed(self, marker_id: int):
         for callback in self.target_marker_changed_callbacks:
             callback(marker_id)
+
+    def _notify_robot_move_started(self):
+        for callback in self.robot_move_started_callbacks:
+            callback()
+
+    def _notify_robot_move_failed(self, reason: str):
+        for callback in self.robot_move_failed_callbacks:
+            callback(reason)
 
     # API -------------------------------------------------------------
 
@@ -548,6 +565,8 @@ class RobotThread(threading.Thread):
         move_to_home(self.base)
 
     def _do_move(self, symbol: str):
+        self._notify_robot_move_started()
+        
         # 0. Get current frame from camera
         img = self.camera_thread.get_last_frame()
         if img is None:
@@ -570,27 +589,49 @@ class RobotThread(threading.Thread):
             self.model._notify_game_over(winner)
             return
 
-        # 3. Find robot's marker to pick up.
-        try:
-            marker_id, x, y, _, yaw = find_marker_by_type(
-                self.tracker, img, marker_type=symbol
-            )
-            print(f"Marker is found {marker_id} of type {symbol}")
+        # 3. Find robot's marker to pick up with limited attempts
+        marker_found = False
+        max_attempts = 10
+        attempt = 0
+        
+        while not marker_found and attempt < max_attempts:
+            attempt += 1
+            print(f"[DEBUG] Marker search attempt {attempt}/{max_attempts}")
             
-            self._notify_target_marker_changed(marker_id)
+            # Get fresh frame for each attempt
+            img = self.camera_thread.get_last_frame()
+            if img is None:
+                print("[ERROR] No frame available from camera")
+                time.sleep(0.5)
+                continue
+                
+            try:
+                marker_id, x, y, _, yaw = find_marker_by_type(
+                    self.tracker, img, marker_type=symbol
+                )
+                print(f"Marker is found {marker_id} of type {symbol}")
+                
+                self._notify_target_marker_changed(marker_id)
 
-            detections = self.tracker.detect_markers(img)
-            home_yaw = None
-            for mid, data in detections:
-                if mid == 0:  # home marker id
-                    home_yaw = data["orientation"][2]
-                    print(f"Home marker yaw: {home_yaw:.1f}°")
-                    break
+                detections = self.tracker.detect_markers(img)
+                home_yaw = None
+                for mid, data in detections:
+                    if mid == 0:  # home marker id
+                        home_yaw = data["orientation"][2]
+                        print(f"Home marker yaw: {home_yaw:.1f}°")
+                        break
+                
+                marker_found = True
 
-        except RuntimeError as e:
-            print(f"[ERROR] {e}")
-            self._notify_target_marker_changed(-1)
-            return
+            except RuntimeError as e:
+                print(f"[ERROR] Attempt {attempt}: {e}")
+                if attempt < max_attempts:
+                    time.sleep(0.5)  # Wait before next attempt
+                else:
+                    print(f"[ERROR] Failed to find marker after {max_attempts} attempts")
+                    self._notify_target_marker_changed(-1)
+                    self._notify_robot_move_failed("Could not find robot marker")
+                    return
 
         # 4. Find best move
         move = find_best_move(board_from_cam, symbol)
@@ -598,6 +639,7 @@ class RobotThread(threading.Thread):
         if move is None:
             print("No valid move found for the robot.")
             self._notify_target_marker_changed(-1)
+            self._notify_robot_move_failed("No valid moves available")
             winner = self.model.check_winner()
             if winner:
                 self.model._notify_game_over(winner)
@@ -662,7 +704,19 @@ class RobotThread(threading.Thread):
 
         # 6. Update model
         try:
+            # Save previous game state before making the move
+            was_game_over = self.model.check_winner() is not None
+            
             self.model.place(symbol, r, c)
+            
+            # Check if game just ended due to this move
+            is_game_over_now = self.model.check_winner() is not None
+            
+            # If game just ended, give UI time to update before game over notification
+            if not was_game_over and is_game_over_now:
+                print(f"[DEBUG] Game ended due to robot move, waiting before final notifications")
+                time.sleep(0.5)
+            
             self._notify_move_done(r, c, symbol)
             self._notify_target_marker_changed(-1)
         except ValueError as e:
@@ -724,6 +778,7 @@ class AppController:
         self.current_view = "menu"  # menu, camera, game
         self.game_over_flag = False
         self.winner = None
+        self.robot_making_move = False  # Track if robot is currently making a move
 
     def set_main_loop(self, loop):
         self._main_loop = loop
@@ -755,6 +810,8 @@ class AppController:
             self.robot_thread.add_calibration_done_callback(self._on_calibration_done_sync)
             self.robot_thread.add_move_done_callback(self._on_robot_move_done_sync)
             self.robot_thread.add_target_marker_changed_callback(self._on_target_marker_changed_sync)
+            self.robot_thread.add_robot_move_started_callback(self._on_robot_move_started_sync)
+            self.robot_thread.add_robot_move_failed_callback(self._on_robot_move_failed_sync)
 
     def _on_board_changed_sync(self):
         try:
@@ -765,6 +822,7 @@ class AppController:
     def _on_game_over_sync(self, winner: str):
         self.game_over_flag = True
         self.winner = winner
+        self.robot_making_move = False  # Reset robot move flag when game ends
         try:
             self._message_queue.put_nowait({
                 "type": "game_over",
@@ -789,6 +847,7 @@ class AppController:
             print("[ERROR] Message queue is full")
 
     def _on_robot_move_done_sync(self, r: int, c: int, symbol: str):
+        self.robot_making_move = False
         if not self.model.check_winner():
             try:
                 self._message_queue.put_nowait({
@@ -802,6 +861,26 @@ class AppController:
         self._target_marker_id = None if marker_id == -1 else marker_id
         self.cam_thread.set_target_marker(self._target_marker_id)
 
+    def _on_robot_move_started_sync(self):
+        self.robot_making_move = True
+        try:
+            self._message_queue.put_nowait({
+                "type": "robot_move_started",
+                "message": "Robot is making a move..."
+            })
+        except queue.Full:
+            pass
+
+    def _on_robot_move_failed_sync(self, reason: str):
+        self.robot_making_move = False
+        try:
+            self._message_queue.put_nowait({
+                "type": "robot_move_failed",
+                "message": f"Robot move failed: {reason}"
+            })
+        except queue.Full:
+            pass
+
     async def _send_game_state(self):
         state = GameState(
             board=self.model.board,
@@ -810,7 +889,8 @@ class AppController:
             game_over=self.game_over_flag,
             winner=self.winner,
             hint=self._hint_pos,
-            robot_connected=self.robot_connected
+            robot_connected=self.robot_connected,
+            robot_making_move=self.robot_making_move
         )
         await manager.send_json({
             "type": "game_state",
@@ -827,7 +907,8 @@ class AppController:
             game_over=self.game_over_flag,
             winner=self.winner,
             hint=self._hint_pos,
-            robot_connected=self.robot_connected
+            robot_connected=self.robot_connected,
+            robot_making_move=self.robot_making_move
         )
 
     def run_calibration(self):
@@ -855,9 +936,11 @@ class AppController:
         self._hint_pos = None
         self.game_over_flag = False
         self.winner = None
+        self.robot_making_move = False
         self.current_view = "game"
 
         if self.robot_symbol == "X":
+            self.robot_making_move = True
             self.robot_thread.make_move(self.robot_symbol)
             return {"message": "Robot is making the first move"}
         else:
@@ -866,6 +949,7 @@ class AppController:
     def trigger_robot_move(self):
         if not self.robot_connected:
             return {"error": "Robot not connected"}
+        self.robot_making_move = True
         self.robot_thread.make_move(self.robot_symbol)
         return {"message": "Robot is making a move"}
 
@@ -876,6 +960,7 @@ class AppController:
         self.current_view = "menu"
         self.game_over_flag = False
         self.winner = None
+        self.robot_making_move = False
         return {"message": "Game ended"}
 
     def shutdown(self):
@@ -1073,6 +1158,15 @@ async def read_root():
         </div>
     </div>
 
+    <!-- Game Over Modal -->
+    <div id="game-over-modal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 1000;">
+        <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #2b2b2b; padding: 30px; border-radius: 10px; text-align: center; max-width: 400px;">
+            <h3>Game Over!</h3>
+            <p id="game-over-message">Game finished</p>
+            <button onclick="hideGameOverModal()">OK</button>
+        </div>
+    </div>
+
     <script>
         let ws = null;
         let currentView = 'menu';
@@ -1100,9 +1194,11 @@ async def read_root():
                 if (img2) img2.src = 'data:image/jpeg;base64,' + data.data;
             } else if (data.type === 'game_state') {
                 updateGameBoard(data.data);
+                updateButtonStates(data.data);
             } else if (data.type === 'game_over') {
+                console.log('[DEBUG] Received game_over message:', data.message);
                 addMessage('Game Over: ' + data.message);
-                setTimeout(() => showMenu(), 2000);
+                showGameOverModal(data.message);
             } else if (data.type === 'calibration_done') {
                 console.log('[DEBUG] Received calibration_done message, showing modal');
                 // Показываем модальное окно калибровки
@@ -1110,6 +1206,15 @@ async def read_root():
                 addMessage(data.message || 'Calibration ready - please confirm board placement');
             } else if (data.type === 'human_turn') {
                 addMessage(data.message);
+            } else if (data.type === 'robot_move_started') {
+                addMessage(data.message);
+            } else if (data.type === 'robot_move_failed') {
+                addMessage(data.message);
+                // If robot failed due to missing markers, show special handling
+                if (data.message.includes('Could not find robot marker') || 
+                    data.message.includes('No valid moves available')) {
+                    showGameOverModal("Robot cannot continue: " + data.message);
+                }
             }
         }
 
@@ -1138,6 +1243,27 @@ async def read_root():
                     
                     board.appendChild(cell);
                 }
+            }
+        }
+
+        function updateButtonStates(gameState) {
+            const humanMoveDoneBtn = document.querySelector('button[onclick="humanMoveDone()"]');
+            const giveUpBtn = document.querySelector('button[onclick="endGame()"]');
+            
+            if (humanMoveDoneBtn) {
+                if (gameState.robot_making_move || gameState.game_over) {
+                    humanMoveDoneBtn.disabled = true;
+                    if (gameState.robot_making_move) {
+                        humanMoveDoneBtn.textContent = 'Robot is thinking...';
+                    }
+                } else {
+                    humanMoveDoneBtn.disabled = false;
+                    humanMoveDoneBtn.textContent = 'My turn is done';
+                }
+            }
+            
+            if (giveUpBtn) {
+                giveUpBtn.disabled = gameState.robot_making_move;
             }
         }
 
@@ -1205,6 +1331,23 @@ async def read_root():
             document.getElementById('calibration-modal').style.display = 'none';
         }
 
+        function showGameOverModal(message) {
+            console.log('[DEBUG] showGameOverModal called with message:', message);
+            document.getElementById('game-over-message').textContent = message;
+            const modal = document.getElementById('game-over-modal');
+            if (modal) {
+                modal.style.display = 'block';
+                console.log('[DEBUG] Game over modal shown');
+            } else {
+                console.error('[ERROR] game-over-modal element not found');
+            }
+        }
+
+        function hideGameOverModal() {
+            document.getElementById('game-over-modal').style.display = 'none';
+            showMenu();
+        }
+
         async function startGame(symbol) {
             hideSymbolChoice();
             showSymbolConfirmation(symbol);
@@ -1232,7 +1375,6 @@ async def read_root():
             } else {
                 addMessage(result.message);
             }
-            // Модальное окно появится автоматически когда рука достигнет позиции калибровки
         }
 
         async function completeCalibration() {
@@ -1252,7 +1394,7 @@ async def read_root():
             const response = await fetch('/end-game', {method: 'POST'});
             const result = await response.json();
             addMessage(result.message || result.error);
-            showMenu();
+            showGameOverModal("You gave up!");
         }
 
         // Initialize

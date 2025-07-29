@@ -1054,6 +1054,16 @@ async def read_root():
         </div>
     </div>
 
+    <!-- Symbol Confirmation Modal -->
+    <div id="symbol-confirmation-modal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 1000;">
+        <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #2b2b2b; padding: 30px; border-radius: 10px; text-align: center; max-width: 400px;">
+            <h3>You are playing as <span id="chosen-symbol">X</span></h3>
+            <p>Ready to start the game?</p>
+            <button onclick="confirmStartGame()">Start Game</button>
+            <button onclick="hideSymbolConfirmation()">Choose Again</button>
+        </div>
+    </div>
+
     <!-- Calibration Modal -->
     <div id="calibration-modal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 1000;">
         <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #2b2b2b; padding: 30px; border-radius: 10px; text-align: center; max-width: 400px;">
@@ -1066,6 +1076,7 @@ async def read_root():
     <script>
         let ws = null;
         let currentView = 'menu';
+        let selectedSymbol = null;
 
         function connectWebSocket() {
             ws = new WebSocket(`ws://${window.location.host}/ws`);
@@ -1168,6 +1179,17 @@ async def read_root():
             document.getElementById('symbol-modal').style.display = 'none';
         }
 
+        function showSymbolConfirmation(symbol) {
+            selectedSymbol = symbol;
+            document.getElementById('chosen-symbol').textContent = symbol;
+            document.getElementById('symbol-confirmation-modal').style.display = 'block';
+        }
+
+        function hideSymbolConfirmation() {
+            document.getElementById('symbol-confirmation-modal').style.display = 'none';
+            showSymbolChoice(); // Возвращаемся к выбору символа
+        }
+
         function showCalibrationModal() {
             console.log('[DEBUG] showCalibrationModal called');
             const modal = document.getElementById('calibration-modal');
@@ -1185,10 +1207,15 @@ async def read_root():
 
         async function startGame(symbol) {
             hideSymbolChoice();
+            showSymbolConfirmation(symbol);
+        }
+
+        async function confirmStartGame() {
+            hideSymbolConfirmation();
             const response = await fetch('/start-game', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({symbol: symbol})
+                body: JSON.stringify({symbol: selectedSymbol})
             });
             const result = await response.json();
             addMessage(result.message || result.error);

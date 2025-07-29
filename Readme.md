@@ -61,6 +61,9 @@ See `logs/README.md` for detailed information about the logging structure.
    - The process repeats until the game is finished (win/draw).
 
 ## Setup Instructions
+
+### ALL MEANT ABOVE SHOULD BE DONE ON DEVICE THAT HAVE CAMERA AND ROBOT ARM CONNECTED
+
 1. **Clone the repository:**
    ```bash
    git clone https://github.com/rcicd/tic-tac-robo.git
@@ -88,7 +91,8 @@ Run the main program and follow on-screen instructions:
 ```bash
 make run
 ```
-- Open the web interface in your browser (default: http://localhost:8000 or http://duckie-rpi-arm.local:8000 for Raspberry Pi)
+- Ensure the robot arm is powered on and connected
+- Open the web interface in your browser (default: http://localhost:8000 or http://<duckie-name>.local:8000 for Raspberry Pi)
 - Press "Configure", arm will move to some position, 
 place the printed game board positioning it's 
 cross under arm pointer. When you are ready, press

@@ -1211,7 +1211,7 @@ async def read_root():
         }
 
         async function confirmStartGame() {
-            hideSymbolConfirmation();
+            document.getElementById('symbol-confirmation-modal').style.display = 'none';
             const response = await fetch('/start-game', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},

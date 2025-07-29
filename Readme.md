@@ -92,7 +92,7 @@ Run the main program and follow on-screen instructions:
 make run
 ```
 - Ensure the robot arm is powered on and connected
-- Open the web interface in your browser (default: http://localhost:8000 or http://<duckie-name>.local:8000 for Raspberry Pi)
+- Open the web interface in your browser (default: http://localhost:8000 or http://\<duckie-name\>.local:8000 for Raspberry Pi)
 - Press "Configure", arm will move to some position, 
 place the printed game board positioning it's 
 cross under arm pointer. When you are ready, press
